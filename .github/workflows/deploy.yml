@@ -22,6 +22,9 @@ jobs:
             **/README.md
             **/.gitignore
         dangerous-clean-slate: false
+
+    - name: Ensure tmp directory exists
+      run: mkdir -p tmp
     
     - name: Trigger Passenger restart
       run: |
