@@ -2,6 +2,10 @@ name: Deploy via FTP to sof-car.eu/api
 on:
   push:
     branches: [main]
+
+permissions:
+  contents: read
+  actions: read
 jobs:
   deploy:
     runs-on: ubuntu-latest
