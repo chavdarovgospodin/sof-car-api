@@ -3,20 +3,18 @@ on:
   push:
     branches: [main]
 
-permissions:
-  contents: write
-  actions: write
-  id-token: write
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: Create .env file
         run: |
           echo "Creating .env file..."
-          cat > .env << 'EOF'
+          cat > .env << EOF
           SUPABASE_URL=${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
           SECRET_KEY=${{ secrets.SECRET_KEY }}
