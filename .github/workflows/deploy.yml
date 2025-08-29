@@ -1,32 +1,60 @@
 name: Deploy via FTP to sof-car.eu/api
 on:
   push:
-    branches: [ main ]
+    branches: [main]
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Ensure tmp directory exists
-      run: mkdir -p tmp
-    
-    - name: Trigger Passenger restart
-      run: |
-        echo "restart $(date)" > tmp/restart.txt
+      - name: Create .env file
+        run: |
+          cat > .env << EOF
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
+          SECRET_KEY=${{ secrets.SECRET_KEY }}
+          FLASK_ENV=production
+          RATE_LIMIT_MAX_REQUESTS=3
+          RATE_LIMIT_WINDOW_HOURS=1
+          LOG_LEVEL=INFO
+          EOF
 
-    - name: FTP Deploy
-      uses: SamKirkland/FTP-Deploy-Action@v4.3.5
-      with:
-        server: sof-car.eu
-        username: ${{ secrets.FTP_USERNAME }}  
-        password: ${{ secrets.FTP_PASSWORD }}  
-        local-dir: ./
-        server-dir: /api/  
-        exclude: |
+      - name: Ensure tmp directory exists
+        run: mkdir -p tmp
+
+      - name: Trigger Passenger restart
+        run: |
+          echo "restart $(date)" > tmp/restart.txt
+
+      - name: Install dependencies and create requirements.txt if needed
+        run: |
+          if [ ! -f requirements.txt ]; then
+            echo "Creating requirements.txt..."
+            cat > requirements.txt << EOF
+          Flask==2.3.3
+          Flask-CORS==4.0.0
+          python-dotenv==1.0.0
+          requests==2.31.0
+          supabase==2.0.2
+          flask-limiter==3.5.0
+          EOF
+          fi
+
+      - name: FTP Deploy
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: sof-car.eu
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          local-dir: ./
+          server-dir: /api/
+          exclude: |
             **/.git*
             **/.git*/**
             **/.github/**
             **/README.md
             **/.gitignore
-        dangerous-clean-slate: false
+            **/.env.example
+            **/test_api.py
+          dangerous-clean-slate: false
