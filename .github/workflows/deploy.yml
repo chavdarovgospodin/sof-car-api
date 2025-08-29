@@ -7,6 +7,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+
+    - name: Ensure tmp directory exists
+      run: mkdir -p tmp
+    
+    - name: Trigger Passenger restart
+      run: |
+        echo "restart $(date)" > tmp/restart.txt
+
     - name: FTP Deploy
       uses: SamKirkland/FTP-Deploy-Action@v4.3.5
       with:
@@ -22,10 +30,3 @@ jobs:
             **/README.md
             **/.gitignore
         dangerous-clean-slate: false
-
-    - name: Ensure tmp directory exists
-      run: mkdir -p tmp
-    
-    - name: Trigger Passenger restart
-      run: |
-        echo "restart $(date)" > tmp/restart.txt
