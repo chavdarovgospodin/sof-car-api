@@ -10,7 +10,8 @@ jobs:
 
       - name: Create .env file
         run: |
-          cat > .env << EOF
+          echo "Creating .env file..."
+          cat > .env << 'EOF'
           SUPABASE_URL=${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
           SECRET_KEY=${{ secrets.SECRET_KEY }}
@@ -19,6 +20,8 @@ jobs:
           RATE_LIMIT_WINDOW_HOURS=1
           LOG_LEVEL=INFO
           EOF
+          echo "Contents of .env file:"
+          cat .env
 
       - name: Ensure tmp directory exists
         run: mkdir -p tmp
@@ -26,20 +29,6 @@ jobs:
       - name: Trigger Passenger restart
         run: |
           echo "restart $(date)" > tmp/restart.txt
-
-      - name: Install dependencies and create requirements.txt if needed
-        run: |
-          if [ ! -f requirements.txt ]; then
-            echo "Creating requirements.txt..."
-            cat > requirements.txt << EOF
-          Flask==2.3.3
-          Flask-CORS==4.0.0
-          python-dotenv==1.0.0
-          requests==2.31.0
-          supabase==2.0.2
-          flask-limiter==3.5.0
-          EOF
-          fi
 
       - name: FTP Deploy
         uses: SamKirkland/FTP-Deploy-Action@v4.3.5
