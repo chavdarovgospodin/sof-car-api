@@ -2,7 +2,6 @@
 """
 Passenger WSGI configuration for cPanel deployment
 """
-
 import sys
 import os
 
