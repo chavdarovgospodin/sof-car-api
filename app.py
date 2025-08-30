@@ -217,7 +217,7 @@ def root():
         "timestamp": datetime.now().isoformat()
     })
 
-@app.route('/api/cars', methods=['GET'])
+@app.route('/cars', methods=['GET'])
 def get_cars():
     """Get all available cars with optional filtering"""
     try:
@@ -260,7 +260,7 @@ def get_cars():
         logger.error(f"Error getting cars: {e}")
         return jsonify({"error": "Failed to fetch cars"}), 500
 
-@app.route('/api/cars/<int:car_id>', methods=['GET'])
+@app.route('/cars/<int:car_id>', methods=['GET'])
 def get_car(car_id):
     """Get specific car by ID"""
     try:
@@ -286,7 +286,7 @@ def get_car(car_id):
         logger.error(f"Error getting car {car_id}: {e}")
         return jsonify({"error": "Failed to fetch car"}), 500
 
-@app.route('/api/cars/<int:car_id>/availability', methods=['GET'])
+@app.route('/cars/<int:car_id>/availability', methods=['GET'])
 def get_car_availability(car_id):
     """Get car availability for date range with pricing"""
     try:
@@ -333,7 +333,7 @@ def get_car_availability(car_id):
         logger.error(f"Error getting availability for car {car_id}: {e}")
         return jsonify({"error": "Failed to check availability"}), 500
 
-@app.route('/api/bookings', methods=['POST'])
+@app.route('/bookings', methods=['POST'])
 def create_booking():
     """Create a new booking with optimistic locking"""
     try:
@@ -429,7 +429,7 @@ def create_booking():
         logger.error(f"Error creating booking: {e}")
         return jsonify({"error": "Failed to create booking"}), 500
 
-@app.route('/api/bookings/<int:booking_id>', methods=['GET'])
+@app.route('/bookings/<int:booking_id>', methods=['GET'])
 def get_booking(booking_id):
     """Get booking by ID"""
     try:
@@ -446,7 +446,7 @@ def get_booking(booking_id):
         logger.error(f"Error getting booking {booking_id}: {e}")
         return jsonify({"error": "Failed to fetch booking"}), 500
 
-@app.route('/api/bookings/reference/<booking_reference>', methods=['GET'])
+@app.route('/bookings/reference/<booking_reference>', methods=['GET'])
 def get_booking_by_reference(booking_reference):
     """Get booking by reference number"""
     try:
@@ -463,7 +463,7 @@ def get_booking_by_reference(booking_reference):
         logger.error(f"Error getting booking {booking_reference}: {e}")
         return jsonify({"error": "Failed to fetch booking"}), 500
 
-@app.route('/api/health', methods=['GET'])
+@app.route('/health', methods=['GET'])
 def health_check():
     """Comprehensive health check endpoint"""
     health_data = {
