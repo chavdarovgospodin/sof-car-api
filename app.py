@@ -379,9 +379,28 @@ def generate_booking_reference():
 def check_car_availability_atomic(car_id, start_date, end_date):
     """Atomic availability check with better logic"""
     try:
+        logger.info(f"Checking availability for car {car_id} from {start_date} to {end_date}")
+        
+        # Check for overlapping confirmed bookings
+        overlap_query = supabase.table("bookings").select("id").eq("car_id", car_id).in_("status", ["confirmed", "pending"]).or_(
+            f"start_date.lte.{end_date},end_date.gt.{start_date}"
+        ).execute()
+        
+        logger.info(f"Overlap query result: {overlap_query.data}")
+        
+        if overlap_query.data:
+            logger.info(f"Car {car_id} is not available - has overlapping bookings")
+            return False, f"Car is booked for overlapping dates"
+        
+        logger.info(f"Car {car_id} is available for the requested dates")
+        return True, None
+    except Exception as e:
+        logger.error(f"Error checking availability: {e}")
+        return False, "Error checking availability"
+    try:
         # Check for overlapping confirmed bookings
         overlap_query = supabase.table('bookings').select('id').eq('car_id', car_id).in_('status', ['confirmed', 'pending']).or_(
-            f"and(start_date.lte.{end_date},end_date.gt.{start_date})"
+            f"start_date.lte.{end_date},end_date.gt.{start_date}"
         ).execute()
         
         if overlap_query.data:
@@ -872,13 +891,13 @@ def get_cars():
         cars = response.data
         
         # If date range provided, filter out unavailable cars
-        if start_date and end_date:
-            available_cars = []
-            for car in cars:
-                is_available, _ = check_car_availability_atomic(car['id'], start_date, end_date)
-                if is_available:
-                    available_cars.append(car)
-            cars = available_cars
+        # if start_date and end_date:
+            # available_cars = []
+            # for car in cars:
+                # is_available, _ = check_car_availability_atomic(car[.id.], start_date, end_date)
+                # if is_available:
+                    # available_cars.append(car)
+            # cars = available_cars
         
         return jsonify({
             "cars": cars,
