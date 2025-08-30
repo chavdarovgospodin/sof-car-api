@@ -18,6 +18,8 @@ jobs:
           SUPABASE_URL=${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
           SECRET_KEY=${{ secrets.SECRET_KEY }}
+          ADMIN_USERNAME=${{ secrets.ADMIN_USERNAME }}
+          ADMIN_PASSWORD=${{ secrets.ADMIN_PASSWORD }}
           FLASK_ENV=production
           RATE_LIMIT_MAX_REQUESTS=3
           RATE_LIMIT_WINDOW_HOURS=1

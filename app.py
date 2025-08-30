@@ -1,7 +1,7 @@
 import os
 import sys
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify, g, session
 from flask_cors import CORS
 import logging
 from supabase import create_client, Client
@@ -10,10 +10,13 @@ import hashlib
 import time
 from typing import Optional, Dict, Any
 import json
-from werkzeug.exceptions import BadRequest, TooManyRequests
+from werkzeug.exceptions import BadRequest, TooManyRequests, Unauthorized
+from werkzeug.utils import secure_filename
 import ipaddress
 from dotenv import load_dotenv
 import uuid
+import mimetypes
+import base64
 
 # Load environment variables
 load_dotenv()
@@ -23,7 +26,7 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key-change-in-production')
 
 # Enable CORS for frontend integration
-CORS(app, origins=['https://sof-car.eu', 'http://localhost:3000'])
+CORS(app, origins=['https://sof-car.eu', 'http://localhost:3000'], supports_credentials=True)
 
 # Configure logging
 log_level = os.environ.get('LOG_LEVEL', 'INFO')
@@ -47,6 +50,15 @@ except Exception as e:
     logger.error(f"Failed to initialize Supabase client: {e}")
     supabase = None
 
+# Admin credentials from environment
+ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'change_this_password')
+
+# File upload settings
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+SUPABASE_BUCKET = 'cars'
+
 # Simple rate limiting storage (in-memory for development)
 rate_limit_storage = {}
 
@@ -64,6 +76,134 @@ def get_client_ip():
     if request.headers.get('X-Forwarded-For'):
         return request.headers.get('X-Forwarded-For').split(',')[0].strip()
     return request.remote_addr or 'unknown'
+
+def allowed_file(filename):
+    """Check if uploaded file is allowed"""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def validate_image_file(file):
+    """Validate uploaded image file"""
+    if not file or file.filename == '':
+        raise BadRequest("No file selected")
+    
+    if not allowed_file(file.filename):
+        raise BadRequest(f"File type not allowed. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}")
+    
+    # Check file size (Flask doesn't automatically enforce this)
+    file.seek(0, os.SEEK_END)
+    file_length = file.tell()
+    file.seek(0)  # Reset file pointer
+    
+    if file_length > MAX_FILE_SIZE:
+        raise BadRequest(f"File size too large. Maximum size: {MAX_FILE_SIZE/1024/1024:.1f}MB")
+    
+    return True
+
+def upload_image_to_supabase(file, car_id, is_main=False):
+    """Upload image to Supabase Storage and create car_images record"""
+    try:
+        # Generate unique filename
+        file_ext = file.filename.rsplit('.', 1)[1].lower()
+        timestamp = int(time.time())
+        filename = f"car_{car_id}_{timestamp}_{uuid.uuid4().hex[:8]}.{file_ext}"
+        
+        # Read file content
+        file_content = file.read()
+        file.seek(0)  # Reset file pointer
+        
+        # Upload to Supabase Storage
+        response = supabase.storage.from_(SUPABASE_BUCKET).upload(
+            filename, 
+            file_content,
+            file_options={
+                "content-type": mimetypes.guess_type(file.filename)[0] or 'image/jpeg',
+                "upsert": False
+            }
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to upload image to Supabase: {response}")
+            raise Exception("Failed to upload image to storage")
+        
+        # Get public URL
+        public_url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(filename)
+        
+        # Create car_images record
+        image_data = {
+            'car_id': car_id,
+            'image_url': public_url,
+            'image_name': secure_filename(file.filename),
+            'is_main': is_main,
+            'sort_order': 1 if is_main else 999,  # Main image first
+            'created_at': datetime.now().isoformat()
+        }
+        
+        image_response = supabase.table('car_images').insert(image_data).execute()
+        
+        if not image_response.data:
+            # Rollback storage upload if database insert fails
+            try:
+                supabase.storage.from_(SUPABASE_BUCKET).remove([filename])
+            except:
+                pass
+            raise Exception("Failed to create image record")
+        
+        return {
+            'filename': filename,
+            'public_url': public_url,
+            'image_record': image_response.data[0]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error uploading image: {e}")
+        raise Exception(f"Failed to upload image: {str(e)}")
+
+def delete_image_from_supabase(image_id):
+    """Delete image from both storage and database"""
+    try:
+        # Get image record first
+        image_response = supabase.table('car_images').select('*').eq('id', image_id).execute()
+        
+        if not image_response.data:
+            return False
+        
+        image = image_response.data[0]
+        
+        # Extract filename from URL
+        filename = image['image_url'].split('/')[-1]
+        
+        # Delete from storage
+        try:
+            supabase.storage.from_(SUPABASE_BUCKET).remove([filename])
+        except Exception as e:
+            logger.warning(f"Failed to delete image from storage: {e}")
+        
+        # Delete from database
+        delete_response = supabase.table('car_images').delete().eq('id', image_id).execute()
+        
+        return len(delete_response.data) > 0
+        
+    except Exception as e:
+        logger.error(f"Error deleting image: {e}")
+        return False
+
+# Admin Authentication Decorator
+def admin_required(f):
+    """Decorator to require admin authentication"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'admin_logged_in' not in session or not session['admin_logged_in']:
+            return jsonify({'error': 'Admin authentication required'}), 401
+        
+        # Check session expiry
+        if 'admin_login_time' in session:
+            login_time = datetime.fromisoformat(session['admin_login_time'])
+            if datetime.now() - login_time > timedelta(hours=8):  # 8 hour session
+                session.clear()
+                return jsonify({'error': 'Session expired'}), 401
+        
+        return f(*args, **kwargs)
+    return decorated_function
 
 def check_rate_limit():
     """Enhanced rate limiting check"""
@@ -108,6 +248,53 @@ def validate_date_format(date_str: str) -> bool:
         return True
     except ValueError:
         return False
+
+def validate_car_data(data):
+    """Validate car data for create/update operations"""
+    required_fields = ['brand', 'model', 'year', 'class', 'price_per_day']
+    
+    for field in required_fields:
+        if field not in data or not data[field]:
+            raise BadRequest(f"Missing required field: {field}")
+    
+    # Validate year
+    try:
+        year = int(data['year'])
+        current_year = datetime.now().year
+        if year < 1900 or year > current_year + 2:
+            raise BadRequest("Invalid year")
+    except (ValueError, TypeError):
+        raise BadRequest("Year must be a valid number")
+    
+    # Validate price
+    try:
+        price = float(data['price_per_day'])
+        if price <= 0:
+            raise BadRequest("Price must be positive")
+    except (ValueError, TypeError):
+        raise BadRequest("Price must be a valid number")
+    
+    # Validate deposit amount if provided
+    if 'deposit_amount' in data and data['deposit_amount'] is not None:
+        try:
+            deposit = float(data['deposit_amount'])
+            if deposit < 0:
+                raise BadRequest("Deposit amount cannot be negative")
+        except (ValueError, TypeError):
+            raise BadRequest("Deposit amount must be a valid number")
+    
+    # Validate features if provided
+    if 'features' in data and data['features'] is not None:
+        if isinstance(data['features'], str):
+            try:
+                data['features'] = json.loads(data['features'])
+            except json.JSONDecodeError:
+                raise BadRequest("Features must be valid JSON array")
+        
+        if not isinstance(data['features'], list):
+            raise BadRequest("Features must be an array")
+    
+    return data
 
 def validate_booking_data(data):
     """Enhanced validation for booking data"""
@@ -205,16 +392,462 @@ def check_car_availability_atomic(car_id, start_date, end_date):
         logger.error(f"Error checking availability: {e}")
         return False, "Error checking availability"
 
-# API Endpoints
+# ADMIN API ENDPOINTS
+
+@app.route('/admin/login', methods=['POST'])
+def admin_login():
+    """Admin login endpoint"""
+    try:
+        data = request.get_json()
+        if not data or 'username' not in data or 'password' not in data:
+            return jsonify({'error': 'Username and password required'}), 400
+        
+        username = data['username']
+        password = data['password']
+        
+        # Simple credential check
+        if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+            session['admin_logged_in'] = True
+            session['admin_username'] = username
+            session['admin_login_time'] = datetime.now().isoformat()
+            session.permanent = True
+            
+            logger.info(f"Admin login successful for {username} from IP: {get_client_ip()}")
+            
+            return jsonify({
+                'success': True,
+                'message': 'Login successful',
+                'admin': username,
+                'session_expires': (datetime.now() + timedelta(hours=8)).isoformat()
+            })
+        else:
+            logger.warning(f"Failed admin login attempt for username '{username}' from IP: {get_client_ip()}")
+            return jsonify({'error': 'Invalid credentials'}), 401
+    
+    except Exception as e:
+        logger.error(f"Error in admin login: {e}")
+        return jsonify({'error': 'Login failed'}), 500
+
+@app.route('/admin/logout', methods=['POST'])
+@admin_required
+def admin_logout():
+    """Admin logout endpoint"""
+    session.clear()
+    return jsonify({'success': True, 'message': 'Logged out successfully'})
+
+@app.route('/admin/status', methods=['GET'])
+@admin_required
+def admin_status():
+    """Get admin session status"""
+    return jsonify({
+        'logged_in': True,
+        'admin': session.get('admin_username'),
+        'login_time': session.get('admin_login_time'),
+        'session_expires': (datetime.fromisoformat(session.get('admin_login_time', datetime.now().isoformat())) + timedelta(hours=8)).isoformat()
+    })
+
+@app.route('/admin/cars', methods=['GET'])
+@admin_required
+def admin_get_cars():
+    """Get all cars for admin (including inactive)"""
+    try:
+        if not supabase:
+            return jsonify({"error": "Database not available"}), 503
+        
+        # Get all cars (including inactive ones for admin)
+        response = supabase.table('cars').select('*, car_images(*)').order('created_at', desc=True).execute()
+        
+        cars = response.data
+        
+        # Add summary statistics
+        total_cars = len(cars)
+        active_cars = len([car for car in cars if car.get('is_active', True)])
+        inactive_cars = total_cars - active_cars
+        
+        return jsonify({
+            "cars": cars,
+            "statistics": {
+                "total": total_cars,
+                "active": active_cars,
+                "inactive": inactive_cars
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error getting cars for admin: {e}")
+        return jsonify({"error": "Failed to fetch cars"}), 500
+
+@app.route('/admin/cars', methods=['POST'])
+@admin_required
+def admin_create_car():
+    """Create new car with optional image upload"""
+    try:
+        if not supabase:
+            return jsonify({"error": "Database not available"}), 503
+        
+        # Handle multipart/form-data for file upload
+        if request.content_type and request.content_type.startswith('multipart/form-data'):
+            car_data = {}
+            
+            # Extract form fields
+            for key in request.form:
+                value = request.form[key]
+                if key == 'features' and value:
+                    try:
+                        car_data[key] = json.loads(value)
+                    except json.JSONDecodeError:
+                        car_data[key] = [feature.strip() for feature in value.split(',') if feature.strip()]
+                elif key in ['year', 'price_per_day', 'deposit_amount']:
+                    try:
+                        car_data[key] = float(value) if key in ['price_per_day', 'deposit_amount'] else int(value)
+                    except (ValueError, TypeError):
+                        pass
+                elif key == 'is_active':
+                    car_data[key] = value.lower() in ['true', '1', 'yes', 'on']
+                else:
+                    car_data[key] = value
+            
+            # Handle file upload
+            uploaded_image = request.files.get('image')
+        else:
+            # Handle JSON data
+            car_data = request.get_json()
+            if not car_data:
+                return jsonify({"error": "No data provided"}), 400
+            uploaded_image = None
+        
+        # Validate car data
+        validated_data = validate_car_data(car_data)
+        
+        # Set defaults
+        validated_data['is_active'] = validated_data.get('is_active', True)
+        validated_data['deposit_amount'] = validated_data.get('deposit_amount', 500.00)
+        validated_data['created_at'] = datetime.now().isoformat()
+        validated_data['updated_at'] = datetime.now().isoformat()
+        
+        # Create car record
+        car_response = supabase.table('cars').insert(validated_data).execute()
+        
+        if not car_response.data:
+            return jsonify({"error": "Failed to create car"}), 500
+        
+        car = car_response.data[0]
+        car_id = car['id']
+        
+        # Handle image upload if provided
+        image_info = None
+        if uploaded_image and uploaded_image.filename:
+            try:
+                validate_image_file(uploaded_image)
+                image_info = upload_image_to_supabase(uploaded_image, car_id, is_main=True)
+                logger.info(f"Image uploaded for car {car_id}: {image_info['filename']}")
+            except Exception as e:
+                logger.error(f"Failed to upload image for car {car_id}: {e}")
+                # Don't fail car creation if image upload fails
+                image_info = {"error": str(e)}
+        
+        # Get complete car data with images
+        complete_car_response = supabase.table('cars').select('*, car_images(*)').eq('id', car_id).execute()
+        complete_car = complete_car_response.data[0] if complete_car_response.data else car
+        
+        logger.info(f"Car created by admin {session['admin_username']}: {car['brand']} {car['model']} (ID: {car_id})")
+        
+        return jsonify({
+            "success": True,
+            "car": complete_car,
+            "image_upload": image_info,
+            "message": "Car created successfully"
+        }), 201
+        
+    except BadRequest as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Error creating car: {e}")
+        return jsonify({"error": "Failed to create car"}), 500
+
+@app.route('/admin/cars/<int:car_id>', methods=['PUT'])
+@admin_required
+def admin_update_car(car_id):
+    """Update existing car with optional image upload/replacement"""
+    try:
+        if not supabase:
+            return jsonify({"error": "Database not available"}), 503
+        
+        # Check if car exists
+        existing_car_response = supabase.table('cars').select('*').eq('id', car_id).execute()
+        if not existing_car_response.data:
+            return jsonify({"error": "Car not found"}), 404
+        
+        # Handle multipart/form-data for file upload
+        if request.content_type and request.content_type.startswith('multipart/form-data'):
+            car_data = {}
+            
+            # Extract form fields
+            for key in request.form:
+                value = request.form[key]
+                if key == 'features' and value:
+                    try:
+                        car_data[key] = json.loads(value)
+                    except json.JSONDecodeError:
+                        car_data[key] = [feature.strip() for feature in value.split(',') if feature.strip()]
+                elif key in ['year', 'price_per_day', 'deposit_amount']:
+                    try:
+                        car_data[key] = float(value) if key in ['price_per_day', 'deposit_amount'] else int(value)
+                    except (ValueError, TypeError):
+                        pass
+                elif key == 'is_active':
+                    car_data[key] = value.lower() in ['true', '1', 'yes', 'on']
+                else:
+                    car_data[key] = value
+            
+            # Handle file uploads
+            uploaded_image = request.files.get('image')
+            replace_main_image = request.form.get('replace_main_image', 'false').lower() == 'true'
+        else:
+            # Handle JSON data
+            car_data = request.get_json()
+            if not car_data:
+                return jsonify({"error": "No data provided"}), 400
+            uploaded_image = None
+            replace_main_image = False
+        
+        # Remove empty fields to avoid overwriting with None
+        car_data = {k: v for k, v in car_data.items() if v is not None and v != ''}
+        
+        if car_data:
+            # Validate car data if there are updates
+            validated_data = validate_car_data({**existing_car_response.data[0], **car_data})
+            
+            # Set update timestamp
+            validated_data['updated_at'] = datetime.now().isoformat()
+            
+            # Update car record
+            car_response = supabase.table('cars').update(validated_data).eq('id', car_id).execute()
+            
+            if not car_response.data:
+                return jsonify({"error": "Failed to update car"}), 500
+        
+        # Handle image upload/replacement if provided
+        image_info = None
+        if uploaded_image and uploaded_image.filename:
+            try:
+                validate_image_file(uploaded_image)
+                
+                # If replacing main image, delete the old main image first
+                if replace_main_image:
+                    old_main_images = supabase.table('car_images').select('*').eq('car_id', car_id).eq('is_main', True).execute()
+                    for old_image in old_main_images.data:
+                        delete_image_from_supabase(old_image['id'])
+                
+                # Upload new image
+                image_info = upload_image_to_supabase(uploaded_image, car_id, is_main=True)
+                logger.info(f"Image uploaded for car {car_id}: {image_info['filename']}")
+                
+            except Exception as e:
+                logger.error(f"Failed to upload image for car {car_id}: {e}")
+                image_info = {"error": str(e)}
+        
+        # Get complete updated car data with images
+        complete_car_response = supabase.table('cars').select('*, car_images(*)').eq('id', car_id).execute()
+        complete_car = complete_car_response.data[0] if complete_car_response.data else None
+        
+        logger.info(f"Car updated by admin {session['admin_username']}: Car ID {car_id}")
+        
+        return jsonify({
+            "success": True,
+            "car": complete_car,
+            "image_upload": image_info,
+            "message": "Car updated successfully"
+        })
+        
+    except BadRequest as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Error updating car {car_id}: {e}")
+        return jsonify({"error": "Failed to update car"}), 500
+
+@app.route('/admin/cars/<int:car_id>', methods=['DELETE'])
+@admin_required
+def admin_delete_car(car_id):
+    """Delete car and all its images"""
+    try:
+        if not supabase:
+            return jsonify({"error": "Database not available"}), 503
+        
+        # Check if car exists
+        existing_car_response = supabase.table('cars').select('*').eq('id', car_id).execute()
+        if not existing_car_response.data:
+            return jsonify({"error": "Car not found"}), 404
+        
+        car = existing_car_response.data[0]
+        
+        # Check for existing bookings
+        bookings_response = supabase.table('bookings').select('id').eq('car_id', car_id).in_('status', ['confirmed', 'pending']).execute()
+        if bookings_response.data:
+            return jsonify({"error": "Cannot delete car with existing bookings"}), 409
+        
+        # Delete all car images first
+        images_response = supabase.table('car_images').select('*').eq('car_id', car_id).execute()
+        deleted_images = []
+        
+        for image in images_response.data:
+            if delete_image_from_supabase(image['id']):
+                deleted_images.append(image['id'])
+        
+        # Delete car record
+        car_delete_response = supabase.table('cars').delete().eq('id', car_id).execute()
+        
+        if not car_delete_response.data:
+            return jsonify({"error": "Failed to delete car"}), 500
+        
+        logger.info(f"Car deleted by admin {session['admin_username']}: {car['brand']} {car['model']} (ID: {car_id})")
+        
+        return jsonify({
+            "success": True,
+            "deleted_car": car,
+            "deleted_images": deleted_images,
+            "message": "Car and all images deleted successfully"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error deleting car {car_id}: {e}")
+        return jsonify({"error": "Failed to delete car"}), 500
+
+@app.route('/admin/cars/<int:car_id>/images/<int:image_id>', methods=['DELETE'])
+@admin_required
+def admin_delete_car_image(car_id, image_id):
+    """Delete specific car image"""
+    try:
+        if not supabase:
+            return jsonify({"error": "Database not available"}), 503
+        
+        # Verify image belongs to the car
+        image_response = supabase.table('car_images').select('*').eq('id', image_id).eq('car_id', car_id).execute()
+        
+        if not image_response.data:
+            return jsonify({"error": "Image not found"}), 404
+        
+        image = image_response.data[0]
+        
+        # Delete image
+        if delete_image_from_supabase(image_id):
+            logger.info(f"Image deleted by admin {session['admin_username']}: Image ID {image_id} for car {car_id}")
+            return jsonify({
+                "success": True,
+                "deleted_image": image,
+                "message": "Image deleted successfully"
+            })
+        else:
+            return jsonify({"error": "Failed to delete image"}), 500
+            
+    except Exception as e:
+        logger.error(f"Error deleting image {image_id}: {e}")
+        return jsonify({"error": "Failed to delete image"}), 500
+
+@app.route('/admin/bookings', methods=['GET'])
+@admin_required
+def admin_get_bookings():
+    """Get all bookings for admin with filtering options"""
+    try:
+        if not supabase:
+            return jsonify({"error": "Database not available"}), 503
+        
+        # Get query parameters
+        status = request.args.get('status')
+        car_id = request.args.get('car_id')
+        start_date = request.args.get('start_date')
+        end_date = request.args.get('end_date')
+        limit = request.args.get('limit', 100)
+        offset = request.args.get('offset', 0)
+        
+        # Build query
+        query = supabase.table('bookings').select('*, cars(brand, model, year, class)')
+        
+        # Apply filters
+        if status:
+            query = query.eq('status', status)
+        
+        if car_id:
+            try:
+                query = query.eq('car_id', int(car_id))
+            except ValueError:
+                return jsonify({"error": "Invalid car_id"}), 400
+        
+        if start_date:
+            if not validate_date_format(start_date):
+                return jsonify({"error": "Invalid start_date format"}), 400
+            query = query.gte('start_date', start_date)
+        
+        if end_date:
+            if not validate_date_format(end_date):
+                return jsonify({"error": "Invalid end_date format"}), 400
+            query = query.lte('end_date', end_date)
+        
+        # Apply pagination and ordering
+        try:
+            limit = min(int(limit), 500)  # Max 500 records
+            offset = max(int(offset), 0)
+        except ValueError:
+            return jsonify({"error": "Invalid limit or offset"}), 400
+        
+        query = query.order('created_at', desc=True).limit(limit).offset(offset)
+        
+        # Execute query
+        response = query.execute()
+        bookings = response.data
+        
+        # Get summary statistics
+        stats_query = supabase.table('bookings').select('status, total_price')
+        if start_date:
+            stats_query = stats_query.gte('start_date', start_date)
+        if end_date:
+            stats_query = stats_query.lte('end_date', end_date)
+        
+        stats_response = stats_query.execute()
+        
+        # Calculate statistics
+        total_bookings = len(stats_response.data)
+        pending_bookings = len([b for b in stats_response.data if b['status'] == 'pending'])
+        confirmed_bookings = len([b for b in stats_response.data if b['status'] == 'confirmed'])
+        cancelled_bookings = len([b for b in stats_response.data if b['status'] == 'cancelled'])
+        total_revenue = sum([float(b['total_price'] or 0) for b in stats_response.data if b['status'] == 'confirmed'])
+        
+        return jsonify({
+            "bookings": bookings,
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "returned": len(bookings)
+            },
+            "filters": {
+                "status": status,
+                "car_id": car_id,
+                "start_date": start_date,
+                "end_date": end_date
+            },
+            "statistics": {
+                "total": total_bookings,
+                "pending": pending_bookings,
+                "confirmed": confirmed_bookings,
+                "cancelled": cancelled_bookings,
+                "total_revenue": total_revenue
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting bookings for admin: {e}")
+        return jsonify({"error": "Failed to fetch bookings"}), 500
+
+# EXISTING PUBLIC API ENDPOINTS (unchanged)
 
 @app.route('/', methods=['GET'])
 def root():
     """Root endpoint"""
     return jsonify({
         "message": "Sof Car API",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "status": "running",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "admin_endpoints": "/admin/*"
     })
 
 @app.route('/cars', methods=['GET'])
@@ -390,7 +1023,7 @@ def create_booking():
                 'rental_days': rental_days,
                 'status': 'pending',  # Start as pending, confirm after payment
                 'payment_method': validated_data.get('payment_method', 'cash'),
-                'deposit_amount': 500.00,
+                'deposit_amount': car['deposit_amount'],
                 'deposit_status': 'pending',
                 'booking_reference': generate_booking_reference(),
                 'ip_address': get_client_ip(),
@@ -469,7 +1102,7 @@ def health_check():
     health_data = {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "version": "1.1.0",
+        "version": "1.2.0",
         "environment": os.environ.get('FLASK_ENV', 'development')
     }
     
@@ -494,6 +1127,7 @@ def health_check():
     health_data['rate_limiting'] = 'active' if rate_limit_storage is not None else 'inactive'
     health_data['active_booking_locks'] = len(booking_locks)
     health_data['rate_limit_entries'] = len(rate_limit_storage)
+    health_data['admin_session'] = 'active' if session.get('admin_logged_in') else 'inactive'
     
     return jsonify(health_data), status_code
 
@@ -514,6 +1148,10 @@ def handle_rate_limit_exceeded(error):
 @app.errorhandler(BadRequest)
 def handle_bad_request(error):
     return jsonify({'error': 'Bad request', 'details': str(error)}), 400
+
+@app.errorhandler(Unauthorized)
+def handle_unauthorized(error):
+    return jsonify({'error': 'Unauthorized access'}), 401
 
 if __name__ == '__main__':
     # Development server
