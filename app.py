@@ -23,10 +23,22 @@ load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key-change-in-production')
 
-# Enable CORS for frontend integration
-CORS(app, origins=['https://sof-car.eu', 'http://localhost:3000'], supports_credentials=True)
+app.config.update(
+    SECRET_KEY=os.environ.get('SECRET_KEY'),  # Нов key
+    SESSION_COOKIE_SECURE=True,   # True за HTTPS
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='None',  # За cross-origin (localhost → sof-car.eu)
+    SESSION_COOKIE_DOMAIN=None,
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8)
+)
+
+CORS(app, 
+     origins=['https://sof-car.eu', 'http://localhost:3000', 'https://localhost:3000'], 
+     supports_credentials=True,
+     allow_headers=['Content-Type', 'Authorization'],
+     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
+)
 
 # Configure logging
 log_level = os.environ.get('LOG_LEVEL', 'INFO')
