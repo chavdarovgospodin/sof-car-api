@@ -1017,7 +1017,7 @@ def get_car(car_id):
         logger.error(f"Error getting car {car_id}: {e}")
         return jsonify({"error": "Failed to fetch car"}), 500
 
-@app.route('/cars/<car_id>/availability', methods=['GET'])  # Remove <int:car_id>
+@app.route('/cars/<car_id>/availability', methods=['GET'])
 def get_car_availability(car_id):
     """Get car availability for date range with pricing"""
     try:
