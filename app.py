@@ -641,13 +641,18 @@ def admin_create_car():
         logger.error(f"Error creating car: {e}")
         return jsonify({"error": "Failed to create car"}), 500
 
-@app.route('/admin/cars/<int:car_id>', methods=['PUT'])
+@app.route('/admin/cars/<car_id>', methods=['PUT'])
 @admin_required
 def admin_update_car(car_id):
     """Update existing car with optional image upload/replacement"""
     try:
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
+        
+        try:
+            uuid.UUID(car_id)  # Validate it's a proper UUID
+        except ValueError:
+            return jsonify({"error": "Invalid car ID format"}), 400
         
         # Check if car exists
         existing_car_response = supabase.table('cars').select('*').eq('id', car_id).execute()
@@ -750,6 +755,11 @@ def admin_delete_car(car_id):
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
+        try:
+            uuid.UUID(car_id)  # Validate it's a proper UUID
+        except ValueError:
+            return jsonify({"error": "Invalid car ID format"}), 400
+        
         # Check if car exists
         existing_car_response = supabase.table('cars').select('*').eq('id', car_id).execute()
         if not existing_car_response.data:
@@ -789,13 +799,19 @@ def admin_delete_car(car_id):
         logger.error(f"Error deleting car {car_id}: {e}")
         return jsonify({"error": "Failed to delete car"}), 500
 
-@app.route('/admin/cars/<int:car_id>/images/<int:image_id>', methods=['DELETE'])
+@app.route('/admin/cars/<car_id>/images/<image_id>', methods=['DELETE'])
 @admin_required
 def admin_delete_car_image(car_id, image_id):
     """Delete specific car image"""
     try:
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
+        
+        try:
+            uuid.UUID(car_id)
+            uuid.UUID(image_id)
+        except ValueError:
+            return jsonify({"error": "Invalid ID format"}), 400
         
         # Verify image belongs to the car
         image_response = supabase.table('car_images').select('*').eq('id', image_id).eq('car_id', car_id).execute()
@@ -970,12 +986,17 @@ def get_cars():
         logger.error(f"Error getting cars: {e}")
         return jsonify({"error": "Failed to fetch cars"}), 500
 
-@app.route('/cars/<int:car_id>', methods=['GET'])
+@app.route('/cars/<car_id>', methods=['GET'])
 def get_car(car_id):
     """Get specific car by ID"""
     try:
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
+        
+        try:
+            uuid.UUID(car_id)
+        except ValueError:
+            return jsonify({"error": "Invalid car ID format"}), 400
         
         response = supabase.table('cars').select('*').eq('id', car_id).eq('is_active', True).execute()
         
@@ -996,12 +1017,17 @@ def get_car(car_id):
         logger.error(f"Error getting car {car_id}: {e}")
         return jsonify({"error": "Failed to fetch car"}), 500
 
-@app.route('/cars/<int:car_id>/availability', methods=['GET'])
+@app.route('/cars/<car_id>/availability', methods=['GET'])  # Remove <int:car_id>
 def get_car_availability(car_id):
     """Get car availability for date range with pricing"""
     try:
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
+        
+        try:
+            uuid.UUID(car_id)
+        except ValueError:
+            return jsonify({"error": "Invalid car ID format"}), 400
         
         start_date = request.args.get('start_date')
         end_date = request.args.get('end_date')
