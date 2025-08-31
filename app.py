@@ -305,7 +305,25 @@ def validate_car_data(data):
         
         if not isinstance(data['features'], list):
             raise BadRequest("Features must be an array")
+        
+            # Validate fuel type if provided
+    if 'fuel_type' in data and data['fuel_type']:
+        allowed_fuel_types = ['petrol', 'diesel', 'hybrid', 'electric', 'lpg']
+        if data['fuel_type'] not in allowed_fuel_types:
+            raise BadRequest(f"Invalid fuel type. Allowed: {', '.join(allowed_fuel_types)}")
+
+            # Validate transmission if provided
+    if 'transmission' in data and data['transmission']:
+        allowed_transmissions = ['manual', 'automatic', 'cvt', 'semi-automatic']
+        if data['transmission'] not in allowed_transmissions:
+            raise BadRequest(f"Invalid transmission. Allowed: {', '.join(allowed_transmissions)}")
+
+            # Validate car class if provided
+    allowed_classes = ['economy', 'standard', 'premium']
+    if data['class'] not in allowed_classes:
+        raise BadRequest(f"Invalid car class. Allowed: {', '.join(allowed_classes)}")
     
+
     return data
 
 def validate_booking_data(data):
