@@ -1,7 +1,7 @@
 import os
 import sys
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, g, session
+from flask import Flask, request, jsonify, g, session, make_response
 from flask_cors import CORS
 import logging
 from supabase import create_client, Client
@@ -34,11 +34,39 @@ app.config.update(
 )
 
 CORS(app, 
-     origins=['https://sof-car.eu', 'http://localhost:3000', 'https://localhost:3000'], 
+     origins=[
+         'https://sof-car.eu', 
+         'http://localhost:3000', 
+         'https://localhost:3000',
+     ], 
      supports_credentials=True,
-     allow_headers=['Content-Type', 'Authorization'],
-     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
+     allow_headers=[
+         'Content-Type', 
+         'Authorization',
+         'X-Requested-With',
+         'Accept',
+         'Origin',
+         'Cache-Control',
+         'X-File-Name',
+         'X-HTTP-Method-Override'
+     ],
+     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD', 'PATCH'],
+     expose_headers=['Content-Range', 'X-Content-Range'],
+     max_age=86400  # Cache preflight for 24 hours
 )
+
+# Add explicit OPTIONS handler for all admin routes
+@app.before_request
+def handle_preflight():
+    """Handle CORS preflight requests"""
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", request.headers.get('Origin', '*'))
+        response.headers.add('Access-Control-Allow-Headers', "Content-Type,Authorization,X-Requested-With,Accept,Origin,Cache-Control")
+        response.headers.add('Access-Control-Allow-Methods', "GET,POST,PUT,DELETE,OPTIONS,HEAD,PATCH")
+        response.headers.add('Access-Control-Allow-Credentials', 'true')
+        response.headers.add('Access-Control-Max-Age', '86400')
+        return response
 
 # Configure logging
 log_level = os.environ.get('LOG_LEVEL', 'INFO')
