@@ -531,10 +531,17 @@ def admin_get_cars():
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
-        # Get all cars (including inactive ones for admin)
-        response = supabase.table('cars').select('*, car_images(*)').order('created_at', desc=True).execute()
+        response = supabase.table('cars').select('*').order('created_at', desc=True).execute()
         
         cars = response.data
+        
+        for car in cars:
+            try:
+                images_response = supabase.table('car_images').select('*').eq('car_id', car['id']).order('sort_order').execute()
+                car['car_images'] = images_response.data
+            except Exception as e:
+                logger.warning(f"Failed to get images for car {car['id']}: {e}")
+                car['car_images'] = []
         
         # Add summary statistics
         total_cars = len(cars)
@@ -622,15 +629,18 @@ def admin_create_car():
                 # Don't fail car creation if image upload fails
                 image_info = {"error": str(e)}
         
-        # Get complete car data with images
-        complete_car_response = supabase.table('cars').select('*, car_images(*)').eq('id', car_id).execute()
-        complete_car = complete_car_response.data[0] if complete_car_response.data else car
+        try:
+            images_response = supabase.table('car_images').select('*').eq('car_id', car_id).order('sort_order').execute()
+            car['car_images'] = images_response.data
+        except Exception as e:
+            logger.warning(f"Failed to get images for car {car_id}: {e}")
+            car['car_images'] = []
         
         logger.info(f"Car created by admin {session['admin_username']}: {car['brand']} {car['model']} (ID: {car_id})")
         
         return jsonify({
             "success": True,
-            "car": complete_car,
+            "car": car,
             "image_upload": image_info,
             "message": "Car created successfully"
         }), 201
@@ -650,7 +660,7 @@ def admin_update_car(car_id):
             return jsonify({"error": "Database not available"}), 503
         
         try:
-            uuid.UUID(car_id)  # Validate it's a proper UUID
+            uuid.UUID(car_id)
         except ValueError:
             return jsonify({"error": "Invalid car ID format"}), 400
         
@@ -695,6 +705,8 @@ def admin_update_car(car_id):
         # Remove empty fields to avoid overwriting with None
         car_data = {k: v for k, v in car_data.items() if v is not None and v != ''}
         
+        updated_car = existing_car_response.data[0]  # Start with existing data
+        
         if car_data:
             # Validate car data if there are updates
             validated_data = validate_car_data({**existing_car_response.data[0], **car_data})
@@ -707,6 +719,8 @@ def admin_update_car(car_id):
             
             if not car_response.data:
                 return jsonify({"error": "Failed to update car"}), 500
+            
+            updated_car = car_response.data[0]
         
         # Handle image upload/replacement if provided
         image_info = None
@@ -728,15 +742,18 @@ def admin_update_car(car_id):
                 logger.error(f"Failed to upload image for car {car_id}: {e}")
                 image_info = {"error": str(e)}
         
-        # Get complete updated car data with images
-        complete_car_response = supabase.table('cars').select('*, car_images(*)').eq('id', car_id).execute()
-        complete_car = complete_car_response.data[0] if complete_car_response.data else None
+        try:
+            images_response = supabase.table('car_images').select('*').eq('car_id', car_id).order('sort_order').execute()
+            updated_car['car_images'] = images_response.data
+        except Exception as e:
+            logger.warning(f"Failed to get images for car {car_id}: {e}")
+            updated_car['car_images'] = []
         
         logger.info(f"Car updated by admin {session['admin_username']}: Car ID {car_id}")
         
         return jsonify({
             "success": True,
-            "car": complete_car,
+            "car": updated_car,
             "image_upload": image_info,
             "message": "Car updated successfully"
         })
