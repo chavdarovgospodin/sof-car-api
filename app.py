@@ -139,19 +139,16 @@ def validate_image_file(file):
     
     return True
 
-def upload_image_to_supabase(file, car_id, is_main=False):
-    """Upload image to Supabase Storage and create car_images record"""
+def upload_image_simple(file, car_id):
+    """Upload image and return just the URL"""
     try:
-        # Generate unique filename
         file_ext = file.filename.rsplit('.', 1)[1].lower()
         timestamp = int(time.time())
         filename = f"car_{car_id}_{timestamp}_{uuid.uuid4().hex[:8]}.{file_ext}"
         
-        # Read file content
         file_content = file.read()
-        file.seek(0)  # Reset file pointer
+        file.seek(0)
         
-        # Upload to Supabase Storage
         response = supabase.storage.from_(SUPABASE_BUCKET).upload(
             filename, 
             file_content,
@@ -162,69 +159,24 @@ def upload_image_to_supabase(file, car_id, is_main=False):
         )
         
         if response.status_code != 200:
-            logger.error(f"Failed to upload image to Supabase: {response}")
             raise Exception("Failed to upload image to storage")
         
-        # Get public URL
-        public_url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(filename)
-        
-        # Create car_images record
-        image_data = {
-            'car_id': car_id,
-            'image_url': public_url,
-            'image_name': secure_filename(file.filename),
-            'is_main': is_main,
-            'sort_order': 1 if is_main else 999,  # Main image first
-            'created_at': datetime.now().isoformat()
-        }
-        
-        image_response = supabase.table('car_images').insert(image_data).execute()
-        
-        if not image_response.data:
-            # Rollback storage upload if database insert fails
-            try:
-                supabase.storage.from_(SUPABASE_BUCKET).remove([filename])
-            except:
-                pass
-            raise Exception("Failed to create image record")
-        
-        return {
-            'filename': filename,
-            'public_url': public_url,
-            'image_record': image_response.data[0]
-        }
+        return supabase.storage.from_(SUPABASE_BUCKET).get_public_url(filename)
         
     except Exception as e:
         logger.error(f"Error uploading image: {e}")
         raise Exception(f"Failed to upload image: {str(e)}")
 
-def delete_image_from_supabase(image_id):
-    """Delete image from both storage and database"""
+def delete_image_simple(image_url):
+    """Delete image from storage by URL"""
     try:
-        # Get image record first
-        image_response = supabase.table('car_images').select('*').eq('id', image_id).execute()
-        
-        if not image_response.data:
-            return False
-        
-        image = image_response.data[0]
-        
-        # Extract filename from URL
-        filename = image['image_url'].split('/')[-1]
-        
-        # Delete from storage
-        try:
-            supabase.storage.from_(SUPABASE_BUCKET).remove([filename])
-        except Exception as e:
-            logger.warning(f"Failed to delete image from storage: {e}")
-        
-        # Delete from database
-        delete_response = supabase.table('car_images').delete().eq('id', image_id).execute()
-        
-        return len(delete_response.data) > 0
-        
+        if not image_url:
+            return True
+        filename = image_url.split('/')[-1]
+        supabase.storage.from_(SUPABASE_BUCKET).remove([filename])
+        return True
     except Exception as e:
-        logger.error(f"Error deleting image: {e}")
+        logger.warning(f"Failed to delete image: {e}")
         return False
 
 # Admin Authentication Decorator
@@ -404,13 +356,11 @@ def validate_booking_data(data):
     if not validate_phone(data['client_phone'].strip()):
         raise BadRequest("Invalid phone number format")
     
-    # Validate car_id is positive integer
+    # Validate car_id is valid UUID
     try:
-        car_id = int(data['car_id'])
-        if car_id <= 0:
-            raise BadRequest("Invalid car ID")
-    except (ValueError, TypeError):
-        raise BadRequest("Car ID must be a valid number")
+        uuid.UUID(data['car_id'])
+    except ValueError:
+        raise BadRequest("Invalid car ID format")
     
     # Validate payment method
     payment_method = data.get('payment_method', 'cash')
@@ -532,28 +482,19 @@ def admin_get_cars():
             return jsonify({"error": "Database not available"}), 503
         
         response = supabase.table('cars').select('*').order('created_at', desc=True).execute()
-        
         cars = response.data
         
-        for car in cars:
-            try:
-                images_response = supabase.table('car_images').select('*').eq('car_id', car['id']).order('sort_order').execute()
-                car['car_images'] = images_response.data
-            except Exception as e:
-                logger.warning(f"Failed to get images for car {car['id']}: {e}")
-                car['car_images'] = []
+        # Няма нужда от отделни image queries
         
-        # Add summary statistics
         total_cars = len(cars)
         active_cars = len([car for car in cars if car.get('is_active', True)])
-        inactive_cars = total_cars - active_cars
         
         return jsonify({
             "cars": cars,
             "statistics": {
                 "total": total_cars,
                 "active": active_cars,
-                "inactive": inactive_cars
+                "inactive": total_cars - active_cars
             }
         })
     except Exception as e:
@@ -563,7 +504,7 @@ def admin_get_cars():
 @app.route('/admin/cars', methods=['POST'])
 @admin_required
 def admin_create_car():
-    """Create new car with optional image upload"""
+    """Create new car with optional single image upload"""
     try:
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
@@ -590,7 +531,6 @@ def admin_create_car():
                 else:
                     car_data[key] = value
             
-            # Handle file upload
             uploaded_image = request.files.get('image')
         else:
             # Handle JSON data
@@ -608,40 +548,46 @@ def admin_create_car():
         validated_data['created_at'] = datetime.now().isoformat()
         validated_data['updated_at'] = datetime.now().isoformat()
         
-        # Create car record
-        car_response = supabase.table('cars').insert(validated_data).execute()
-        
-        if not car_response.data:
-            return jsonify({"error": "Failed to create car"}), 500
-        
-        car = car_response.data[0]
-        car_id = car['id']
-        
         # Handle image upload if provided
-        image_info = None
         if uploaded_image and uploaded_image.filename:
             try:
                 validate_image_file(uploaded_image)
-                image_info = upload_image_to_supabase(uploaded_image, car_id, is_main=True)
-                logger.info(f"Image uploaded for car {car_id}: {image_info['filename']}")
+                
+                # Create car first
+                car_response = supabase.table('cars').insert(validated_data).execute()
+                if not car_response.data:
+                    return jsonify({"error": "Failed to create car"}), 500
+                
+                car = car_response.data[0]
+                car_id = car['id']
+                
+                # Upload image and update car
+                image_url = upload_image_simple(uploaded_image, car_id)
+                
+                update_response = supabase.table('cars').update({
+                    'image_url': image_url,
+                    'updated_at': datetime.now().isoformat()
+                }).eq('id', car_id).execute()
+                
+                if update_response.data:
+                    car = update_response.data[0]
+                
+                logger.info(f"Car created with image: {car['brand']} {car['model']} (ID: {car_id})")
+                
             except Exception as e:
-                logger.error(f"Failed to upload image for car {car_id}: {e}")
-                # Don't fail car creation if image upload fails
-                image_info = {"error": str(e)}
-        
-        try:
-            images_response = supabase.table('car_images').select('*').eq('car_id', car_id).order('sort_order').execute()
-            car['car_images'] = images_response.data
-        except Exception as e:
-            logger.warning(f"Failed to get images for car {car_id}: {e}")
-            car['car_images'] = []
-        
-        logger.info(f"Car created by admin {session['admin_username']}: {car['brand']} {car['model']} (ID: {car_id})")
+                logger.error(f"Image upload failed: {e}")
+                return jsonify({"error": f"Car created but image upload failed: {str(e)}"}), 201
+        else:
+            # Create car without image
+            car_response = supabase.table('cars').insert(validated_data).execute()
+            if not car_response.data:
+                return jsonify({"error": "Failed to create car"}), 500
+            car = car_response.data[0]
+            logger.info(f"Car created without image: {car['brand']} {car['model']} (ID: {car_id})")
         
         return jsonify({
             "success": True,
             "car": car,
-            "image_upload": image_info,
             "message": "Car created successfully"
         }), 201
         
@@ -669,6 +615,8 @@ def admin_update_car(car_id):
         if not existing_car_response.data:
             return jsonify({"error": "Car not found"}), 404
         
+        existing_car = existing_car_response.data[0]
+        
         # Handle multipart/form-data for file upload
         if request.content_type and request.content_type.startswith('multipart/form-data'):
             car_data = {}
@@ -691,70 +639,61 @@ def admin_update_car(car_id):
                 else:
                     car_data[key] = value
             
-            # Handle file uploads
             uploaded_image = request.files.get('image')
-            replace_main_image = request.form.get('replace_main_image', 'false').lower() == 'true'
         else:
             # Handle JSON data
             car_data = request.get_json()
             if not car_data:
                 return jsonify({"error": "No data provided"}), 400
             uploaded_image = None
-            replace_main_image = False
         
-        # Remove empty fields to avoid overwriting with None
+        # Remove empty fields
         car_data = {k: v for k, v in car_data.items() if v is not None and v != ''}
         
-        updated_car = existing_car_response.data[0]  # Start with existing data
+        update_data = {}
         
+        # Validate and prepare update data
         if car_data:
-            # Validate car data if there are updates
-            validated_data = validate_car_data({**existing_car_response.data[0], **car_data})
-            
-            # Set update timestamp
-            validated_data['updated_at'] = datetime.now().isoformat()
-            
-            # Update car record
-            car_response = supabase.table('cars').update(validated_data).eq('id', car_id).execute()
-            
-            if not car_response.data:
-                return jsonify({"error": "Failed to update car"}), 500
-            
-            updated_car = car_response.data[0]
+            validation_data = {**existing_car, **car_data}
+            validated_data = validate_car_data(validation_data)
+            update_data.update(validated_data)
         
-        # Handle image upload/replacement if provided
-        image_info = None
+        # Handle image upload/replacement
         if uploaded_image and uploaded_image.filename:
             try:
                 validate_image_file(uploaded_image)
                 
-                # If replacing main image, delete the old main image first
-                if replace_main_image:
-                    old_main_images = supabase.table('car_images').select('*').eq('car_id', car_id).eq('is_main', True).execute()
-                    for old_image in old_main_images.data:
-                        delete_image_from_supabase(old_image['id'])
+                # Delete old image
+                if existing_car.get('image_url'):
+                    delete_image_simple(existing_car['image_url'])
                 
                 # Upload new image
-                image_info = upload_image_to_supabase(uploaded_image, car_id, is_main=True)
-                logger.info(f"Image uploaded for car {car_id}: {image_info['filename']}")
+                image_url = upload_image_simple(uploaded_image, car_id)
+                update_data['image_url'] = image_url
+                
+                logger.info(f"Image updated for car {car_id}")
                 
             except Exception as e:
-                logger.error(f"Failed to upload image for car {car_id}: {e}")
-                image_info = {"error": str(e)}
+                logger.error(f"Image upload failed: {e}")
+                return jsonify({"error": f"Image upload failed: {str(e)}"}), 400
         
-        try:
-            images_response = supabase.table('car_images').select('*').eq('car_id', car_id).order('sort_order').execute()
-            updated_car['car_images'] = images_response.data
-        except Exception as e:
-            logger.warning(f"Failed to get images for car {car_id}: {e}")
-            updated_car['car_images'] = []
+        # Update car
+        if update_data:
+            update_data['updated_at'] = datetime.now().isoformat()
+            
+            car_response = supabase.table('cars').update(update_data).eq('id', car_id).execute()
+            if not car_response.data:
+                return jsonify({"error": "Failed to update car"}), 500
+            
+            updated_car = car_response.data[0]
+        else:
+            updated_car = existing_car
         
         logger.info(f"Car updated by admin {session['admin_username']}: Car ID {car_id}")
         
         return jsonify({
             "success": True,
             "car": updated_car,
-            "image_upload": image_info,
             "message": "Car updated successfully"
         })
         
@@ -764,16 +703,16 @@ def admin_update_car(car_id):
         logger.error(f"Error updating car {car_id}: {e}")
         return jsonify({"error": "Failed to update car"}), 500
 
-@app.route('/admin/cars/<int:car_id>', methods=['DELETE'])
+@app.route('/admin/cars/<car_id>', methods=['DELETE'])
 @admin_required
 def admin_delete_car(car_id):
-    """Delete car and all its images"""
+    """Delete car and its image"""
     try:
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
         try:
-            uuid.UUID(car_id)  # Validate it's a proper UUID
+            uuid.UUID(car_id)
         except ValueError:
             return jsonify({"error": "Invalid car ID format"}), 400
         
@@ -789,17 +728,12 @@ def admin_delete_car(car_id):
         if bookings_response.data:
             return jsonify({"error": "Cannot delete car with existing bookings"}), 409
         
-        # Delete all car images first
-        images_response = supabase.table('car_images').select('*').eq('car_id', car_id).execute()
-        deleted_images = []
-        
-        for image in images_response.data:
-            if delete_image_from_supabase(image['id']):
-                deleted_images.append(image['id'])
+        # Delete image if exists
+        if car.get('image_url'):
+            delete_image_simple(car['image_url'])
         
         # Delete car record
         car_delete_response = supabase.table('cars').delete().eq('id', car_id).execute()
-        
         if not car_delete_response.data:
             return jsonify({"error": "Failed to delete car"}), 500
         
@@ -808,50 +742,12 @@ def admin_delete_car(car_id):
         return jsonify({
             "success": True,
             "deleted_car": car,
-            "deleted_images": deleted_images,
-            "message": "Car and all images deleted successfully"
+            "message": "Car deleted successfully"
         })
         
     except Exception as e:
         logger.error(f"Error deleting car {car_id}: {e}")
         return jsonify({"error": "Failed to delete car"}), 500
-
-@app.route('/admin/cars/<car_id>/images/<image_id>', methods=['DELETE'])
-@admin_required
-def admin_delete_car_image(car_id, image_id):
-    """Delete specific car image"""
-    try:
-        if not supabase:
-            return jsonify({"error": "Database not available"}), 503
-        
-        try:
-            uuid.UUID(car_id)
-            uuid.UUID(image_id)
-        except ValueError:
-            return jsonify({"error": "Invalid ID format"}), 400
-        
-        # Verify image belongs to the car
-        image_response = supabase.table('car_images').select('*').eq('id', image_id).eq('car_id', car_id).execute()
-        
-        if not image_response.data:
-            return jsonify({"error": "Image not found"}), 404
-        
-        image = image_response.data[0]
-        
-        # Delete image
-        if delete_image_from_supabase(image_id):
-            logger.info(f"Image deleted by admin {session['admin_username']}: Image ID {image_id} for car {car_id}")
-            return jsonify({
-                "success": True,
-                "deleted_image": image,
-                "message": "Image deleted successfully"
-            })
-        else:
-            return jsonify({"error": "Failed to delete image"}), 500
-            
-    except Exception as e:
-        logger.error(f"Error deleting image {image_id}: {e}")
-        return jsonify({"error": "Failed to delete image"}), 500
 
 @app.route('/admin/bookings', methods=['GET'])
 @admin_required
@@ -878,7 +774,7 @@ def admin_get_bookings():
         
         if car_id:
             try:
-                query = query.eq('car_id', int(car_id))
+                query = query.eq('car_id', car_id)
             except ValueError:
                 return jsonify({"error": "Invalid car_id"}), 400
         
@@ -1022,13 +918,6 @@ def get_car(car_id):
         
         car = response.data[0]
         
-        # Get car images if they exist
-        try:
-            images_response = supabase.table('car_images').select('*').eq('car_id', car_id).order('sort_order').execute()
-            car['images'] = images_response.data
-        except:
-            car['images'] = []
-        
         return jsonify(car)
     except Exception as e:
         logger.error(f"Error getting car {car_id}: {e}")
@@ -1103,7 +992,7 @@ def create_booking():
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
-        car_id = int(validated_data['car_id'])
+        car_id = validated_data['car_id']
         
         # Simple lock mechanism (in production use Redis or database locks)
         if car_id in booking_locks:
