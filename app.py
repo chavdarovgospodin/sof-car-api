@@ -228,10 +228,7 @@ def validate_phone(phone: str) -> bool:
     import re
     # Remove all non-digit characters
     clean_phone = re.sub(r'\D', '', phone)
-    # Bulgarian phone numbers: +359 + 8 or 9 digits, or just 8 or 9 digits
-    if clean_phone.startswith('359'):
-        clean_phone = clean_phone[3:]
-    return len(clean_phone) >= 8 and len(clean_phone) <= 10 and clean_phone.startswith(('8', '9'))
+    return len(clean_phone) >= 10 and len(clean_phone) <= 15
 
 def validate_date_format(date_str: str) -> bool:
     """Validate date format YYYY-MM-DD"""
@@ -308,7 +305,7 @@ def validate_car_data(data):
 
 def validate_booking_data(data):
     """Enhanced validation for booking data"""
-    required_fields = ['car_id', 'start_date', 'end_date', 'client_name', 'client_email', 'client_phone']
+    required_fields = ['car_id', 'start_date', 'end_date', 'client_last_name', 'client_first_name', 'client_email', 'client_phone']
     
     for field in required_fields:
         if field not in data or not data[field]:
@@ -343,10 +340,14 @@ def validate_booking_data(data):
     except ValueError:
         raise BadRequest("Invalid date format. Use YYYY-MM-DD")
     
-    # Validate client name (minimum 2 characters, letters, spaces and common characters)
+    # Validate client last name (minimum 2 characters, letters, spaces and common characters)
     import re
-    if not re.match(r'^[a-zA-Zа-яА-Я\s\-\.]{2,50}$', data['client_name'].strip()):
-        raise BadRequest("Invalid client name format")
+    if not re.match(r'^[a-zA-Zа-яА-Я\s\-\.]{2,50}$', data['client_last_name'].strip()):
+        raise BadRequest("Invalid client last name format")
+    
+    # Validate client first name (minimum 2 characters, letters, spaces and common characters)
+    if not re.match(r'^[a-zA-Zа-яА-Я\s\-\.]{2,50}$', data['client_first_name'].strip()):
+        raise BadRequest("Invalid client first name format")
     
     # Validate email
     if not validate_email(data['client_email'].strip()):
@@ -1025,7 +1026,8 @@ def create_booking():
                 'car_id': car_id,
                 'start_date': validated_data['start_date'],
                 'end_date': validated_data['end_date'],
-                'client_name': validated_data['client_name'].strip(),
+                'client_last_name': validated_data['client_last_name'].strip(),
+                'client_first_name': validated_data['client_first_name'].strip(),
                 'client_email': validated_data['client_email'].strip().lower(),
                 'client_phone': validated_data['client_phone'].strip(),
                 'total_price': total_price,
