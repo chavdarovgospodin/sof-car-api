@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import uuid
 import mimetypes
 import base64
+import requests
 
 # Load environment variables
 load_dotenv()
@@ -80,19 +81,36 @@ logger = logging.getLogger(__name__)
 try:
     supabase_url = os.environ.get('SUPABASE_URL')
     supabase_key = os.environ.get('SUPABASE_ANON_KEY')
+    supabase_service_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
     
     if not supabase_url or not supabase_key:
         raise ValueError("Missing Supabase environment variables")
     
     supabase: Client = create_client(supabase_url, supabase_key)
     logger.info("Supabase client initialized successfully")
+    
+    # Create service role client for admin operations
+    if supabase_service_key and supabase_service_key != 'your_service_role_key_here':
+        supabase_admin: Client = create_client(supabase_url, supabase_service_key)
+        logger.info("Supabase admin client initialized successfully")
+    else:
+        supabase_admin = supabase  # Fallback to regular client
+        logger.warning("Service role key not configured, using anon key for admin operations")
+        
 except Exception as e:
     logger.error(f"Failed to initialize Supabase client: {e}")
     supabase = None
+    supabase_admin = None
 
 # Admin credentials from environment
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'change_this_password')
+
+# EmailJS configuration
+EMAILJS_SERVICE_ID = os.environ.get('EMAILJS_SERVICE_ID')
+EMAILJS_PUBLIC_KEY = os.environ.get('EMAILJS_PUBLIC_KEY')
+EMAILJS_CONTACT_TEMPLATE_ID = os.environ.get('EMAILJS_CONTACT_TEMPLATE_ID')
+EMAILJS_BOOKING_TEMPLATE_ID = os.environ.get('EMAILJS_BOOKING_TEMPLATE_ID')
 
 # File upload settings
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
@@ -379,11 +397,126 @@ def calculate_total_price(car_price, start_date, end_date):
     
     return total_price
 
-def generate_booking_reference():
-    """Generate unique booking reference"""
-    timestamp = datetime.now().strftime("%y%m%d")
-    unique_id = str(uuid.uuid4())[:8].upper()
-    return f"SOF{timestamp}{unique_id}"
+# EmailJS Functions
+def send_emailjs_email(service_id, template_id, template_params, public_key):
+    """Send email using EmailJS API"""
+    try:
+        url = "https://api.emailjs.com/api/v1.0/email/send"
+        
+        data = {
+            "service_id": service_id,
+            "template_id": template_id,
+            "user_id": public_key,
+            "template_params": template_params
+        }
+        
+        response = requests.post(url, json=data, timeout=30)
+        
+        if response.status_code == 200:
+            logger.info(f"Email sent successfully via EmailJS")
+            return True
+        else:
+            logger.error(f"EmailJS API error: {response.status_code} - {response.text}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error sending email via EmailJS: {e}")
+        return False
+
+def send_booking_confirmation_email(booking_data, car_data):
+    """Send booking confirmation email to client"""
+    if not all([EMAILJS_SERVICE_ID, EMAILJS_BOOKING_TEMPLATE_ID, EMAILJS_PUBLIC_KEY]):
+        logger.warning("EmailJS not configured for booking confirmations")
+        return False
+    
+    # Calculate rental days
+    start_date = datetime.strptime(booking_data['start_date'], '%Y-%m-%d').date()
+    end_date = datetime.strptime(booking_data['end_date'], '%Y-%m-%d').date()
+    rental_days = (end_date - start_date).days
+    
+    template_params = {
+        "client_name": f"{booking_data['client_first_name']} {booking_data['client_last_name']}",
+        "client_email": booking_data['client_email'],
+        "booking_reference": f"SOF{booking_data['id'][:8].upper()}",  # Use booking ID as reference
+        "car_brand": car_data['brand'],
+        "car_model": car_data['model'],
+        "car_year": car_data['year'],
+        "start_date": booking_data['start_date'],
+        "end_date": booking_data['end_date'],
+        "rental_days": rental_days,
+        "total_price": booking_data['total_price'],
+        "deposit_amount": booking_data['deposit_amount'],
+        "payment_method": booking_data['payment_method'],
+        "to_name": f"{booking_data['client_first_name']} {booking_data['client_last_name']}"
+    }
+    
+    return send_emailjs_email(
+        EMAILJS_SERVICE_ID,
+        EMAILJS_BOOKING_TEMPLATE_ID,
+        template_params,
+        EMAILJS_PUBLIC_KEY
+    )
+
+def send_admin_notification_email(booking_data, car_data):
+    """Send admin notification email for new booking using contact template"""
+    if not all([EMAILJS_SERVICE_ID, EMAILJS_CONTACT_TEMPLATE_ID, EMAILJS_PUBLIC_KEY]):
+        logger.warning("EmailJS not configured for admin notifications")
+        return False
+    
+    # Calculate rental days
+    start_date = datetime.strptime(booking_data['start_date'], '%Y-%m-%d').date()
+    end_date = datetime.strptime(booking_data['end_date'], '%Y-%m-%d').date()
+    rental_days = (end_date - start_date).days
+    
+    # Format the message for admin notification
+    admin_message = f"""🚗 НОВА РЕЗЕРВАЦИЯ!
+
+Резервация #: SOF{booking_data['id'][:8].upper()}
+ID: {booking_data['id']}
+
+Автомобил: {car_data['brand']} {car_data['model']} ({car_data['year']})
+Период: {booking_data['start_date']} - {booking_data['end_date']}
+Дни: {rental_days}
+Обща сума: {booking_data['total_price']} лв
+Депозит: {booking_data['deposit_amount']} лв
+Метод на плащане: {booking_data['payment_method']}
+
+Моля, свържете се с клиента за потвърждение."""
+    
+    template_params = {
+        "name": f"Booking System - {booking_data['client_first_name']} {booking_data['client_last_name']}",
+        "email": booking_data['client_email'],
+        "phone": booking_data['client_phone'],
+        "message": admin_message
+    }
+    
+    return send_emailjs_email(
+        EMAILJS_SERVICE_ID,
+        EMAILJS_CONTACT_TEMPLATE_ID,  # Използваме contact template
+        template_params,
+        EMAILJS_PUBLIC_KEY
+    )
+
+def send_contact_form_email(form_data):
+    """Send contact form email"""
+    if not all([EMAILJS_SERVICE_ID, EMAILJS_CONTACT_TEMPLATE_ID, EMAILJS_PUBLIC_KEY]):
+        logger.warning("EmailJS not configured for contact form")
+        return False
+    
+    template_params = {
+        "from_name": form_data['name'],
+        "from_email": form_data['email'],
+        "from_phone": form_data.get('phone', ''),
+        "message": form_data['message'],
+        "to_name": "SofCar Team"
+    }
+    
+    return send_emailjs_email(
+        EMAILJS_SERVICE_ID,
+        EMAILJS_CONTACT_TEMPLATE_ID,
+        template_params,
+        EMAILJS_PUBLIC_KEY
+    )
 
 def check_car_availability_atomic(car_id, start_date, end_date):
     """Atomic availability check with better logic"""
@@ -391,30 +524,17 @@ def check_car_availability_atomic(car_id, start_date, end_date):
         logger.info(f"Checking availability for car {car_id} from {start_date} to {end_date}")
         
         # Check for overlapping confirmed bookings
-        overlap_query = supabase.table("bookings").select("id").eq("car_id", car_id).in_("status", ["confirmed", "pending"]).or_(
-            f"start_date.lte.{end_date},end_date.gt.{start_date}"
-        ).execute()
+        # Use proper Supabase syntax - check for overlapping date ranges
+        # Two separate queries to check for overlaps
+        query1 = supabase.table("bookings").select("id").eq("car_id", car_id).in_("status", ["confirmed", "pending"]).lte("start_date", end_date).gt("end_date", start_date).execute()
         
-        logger.info(f"Overlap query result: {overlap_query.data}")
+        logger.info(f"Overlap query result: {query1.data}")
         
-        if overlap_query.data:
+        if query1.data:
             logger.info(f"Car {car_id} is not available - has overlapping bookings")
             return False, f"Car is booked for overlapping dates"
         
         logger.info(f"Car {car_id} is available for the requested dates")
-        return True, None
-    except Exception as e:
-        logger.error(f"Error checking availability: {e}")
-        return False, "Error checking availability"
-    try:
-        # Check for overlapping confirmed bookings
-        overlap_query = supabase.table('bookings').select('id').eq('car_id', car_id).in_('status', ['confirmed', 'pending']).or_(
-            f"start_date.lte.{end_date},end_date.gt.{start_date}"
-        ).execute()
-        
-        if overlap_query.data:
-            return False, f"Car is booked for overlapping dates"
-        
         return True, None
     except Exception as e:
         logger.error(f"Error checking availability: {e}")
@@ -750,6 +870,119 @@ def admin_delete_car(car_id):
         logger.error(f"Error deleting car {car_id}: {e}")
         return jsonify({"error": "Failed to delete car"}), 500
 
+@app.route('/admin/bookings/<booking_id>', methods=['PUT'])
+@admin_required
+def admin_update_booking(booking_id):
+    """Update booking - only status, deposit_status, and notes allowed"""
+    try:
+        if not supabase:
+            return jsonify({"error": "Database not available"}), 503
+        
+        try:
+            uuid.UUID(booking_id)
+        except ValueError:
+            return jsonify({"error": "Invalid booking ID format"}), 400
+        
+        # Check if booking exists
+        existing_booking_response = supabase.table('bookings').select('*').eq('id', booking_id).execute()
+        if not existing_booking_response.data:
+            return jsonify({"error": "Booking not found"}), 404
+        
+        existing_booking = existing_booking_response.data[0]
+        
+        # Get update data
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        # Only allow specific fields to be updated
+        allowed_fields = ['status', 'deposit_status', 'notes']
+        update_data = {}
+        
+        for field in allowed_fields:
+            if field in data:
+                update_data[field] = data[field]
+        
+        if not update_data:
+            return jsonify({"error": "No valid fields to update"}), 400
+        
+        # Validate status values
+        if 'status' in update_data:
+            valid_statuses = ['pending', 'confirmed', 'cancelled', 'completed']
+            if update_data['status'] not in valid_statuses:
+                return jsonify({"error": f"Invalid status. Allowed: {', '.join(valid_statuses)}"}), 400
+        
+        # Validate deposit_status values
+        if 'deposit_status' in update_data:
+            valid_deposit_statuses = ['pending', 'paid', 'refunded']
+            if update_data['deposit_status'] not in valid_deposit_statuses:
+                return jsonify({"error": f"Invalid deposit_status. Allowed: {', '.join(valid_deposit_statuses)}"}), 400
+        
+        # Add updated timestamp
+        update_data['updated_at'] = datetime.now().isoformat()
+        
+        logger.info(f"Updating booking {booking_id} with data: {update_data}")
+        
+        # Use admin client for update operations
+        admin_client = supabase_admin if supabase_admin else supabase
+        
+        try:
+            # Try update with admin client
+            update_response = admin_client.table('bookings').update(update_data).eq('id', booking_id).execute()
+            logger.info(f"Update response: {update_response}")
+            
+            # Fetch the updated record
+            booking_response = admin_client.table('bookings').select('*').eq('id', booking_id).execute()
+            logger.info(f"Fetch response: {booking_response}")
+            
+        except Exception as e:
+            logger.error(f"Update failed: {e}")
+            error_msg = str(e)
+            if "row-level security policy" in error_msg:
+                return jsonify({
+                    "error": "Update failed due to database permissions. Please check RLS policies or use service role key.",
+                    "details": error_msg
+                }), 500
+            return jsonify({"error": f"Update failed: {error_msg}"}), 500
+        
+        logger.info(f"Supabase update response: {booking_response}")
+        
+        # Check if update was successful
+        if not booking_response.data:
+            logger.error(f"Supabase update failed - no data returned: {booking_response}")
+            return jsonify({"error": "Failed to update booking", "details": str(booking_response)}), 500
+        
+        updated_booking = booking_response.data[0]
+        
+        # Verify the update actually happened by checking the values
+        update_failed = False
+        for field, value in update_data.items():
+            if field != 'updated_at' and updated_booking.get(field) != value:
+                logger.warning(f"Field {field} was not updated properly. Expected: {value}, Got: {updated_booking.get(field)}")
+                update_failed = True
+        
+        if update_failed:
+            logger.error(f"Update verification failed for booking {booking_id}")
+            return jsonify({
+                "error": "Update failed - data was not actually updated in database. This may be due to RLS policies.",
+                "details": "Please check database permissions or use service role key for admin operations."
+            }), 500
+        
+        logger.info(f"Successfully updated booking {booking_id}. New values: {updated_booking}")
+        
+        logger.info(f"Booking updated by admin {session['admin_username']}: Booking ID {booking_id}, Changes: {list(update_data.keys())}")
+        
+        return jsonify({
+            "success": True,
+            "booking": updated_booking,
+            "message": "Booking updated successfully",
+            "updated_fields": list(update_data.keys())
+        })
+        
+    except Exception as e:
+        logger.error(f"Error updating booking {booking_id}: {e}")
+        return jsonify({"error": "Failed to update booking"}), 500
+
 @app.route('/admin/bookings', methods=['GET'])
 @admin_required
 def admin_get_bookings():
@@ -859,42 +1092,18 @@ def root():
 
 @app.route('/cars', methods=['GET'])
 def get_cars():
-    """Get all available cars with optional filtering"""
+    """Get all available cars withhout filtering"""
     try:
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
-        # Get query parameters
-        start_date = request.args.get('start_date')
-        end_date = request.args.get('end_date')
-        car_class = request.args.get('class')
-        
-        # Base query - only active cars
-        query = supabase.table('cars').select('*').eq('is_active', True)
-        
-        if car_class:
-            query = query.eq('class', car_class)
+        query = supabase.table('cars').select('*')
         
         response = query.order('brand').execute()
         cars = response.data
         
-        # If date range provided, filter out unavailable cars
-        # if start_date and end_date:
-            # available_cars = []
-            # for car in cars:
-                # is_available, _ = check_car_availability_atomic(car[.id.], start_date, end_date)
-                # if is_available:
-                    # available_cars.append(car)
-            # cars = available_cars
-        
         return jsonify({
             "cars": cars,
-            "count": len(cars),
-            "filters": {
-                "start_date": start_date,
-                "end_date": end_date,
-                "class": car_class
-            }
         })
     except Exception as e:
         logger.error(f"Error getting cars: {e}")
@@ -1031,27 +1240,37 @@ def create_booking():
                 'client_email': validated_data['client_email'].strip().lower(),
                 'client_phone': validated_data['client_phone'].strip(),
                 'total_price': total_price,
-                'rental_days': rental_days,
                 'status': 'pending',  # Start as pending, confirm after payment
                 'payment_method': validated_data.get('payment_method', 'cash'),
                 'deposit_amount': car['deposit_amount'],
                 'deposit_status': 'pending',
-                'booking_reference': generate_booking_reference(),
                 'ip_address': get_client_ip(),
                 'notes': validated_data.get('notes', ''),
-                'created_at': datetime.now().isoformat(),
-                'version': 1  # For optimistic locking
+                'created_at': datetime.now().isoformat()
             }
             
             # Insert booking
             booking_response = supabase.table('bookings').insert(booking_data).execute()
             
             if not booking_response.data:
-                return jsonify({"error": "Failed to create booking"}), 500
+                return jsonify({"error": "Failed to create booking", "details": str(booking_response.error)}), 500
             
             booking = booking_response.data[0]
             
-            logger.info(f"Booking created: {booking['booking_reference']} for car {car_id} by {booking['client_email']}")
+            logger.info(f"Booking created: SOF{booking['id'][:8].upper()} for car {car_id} by {booking['client_email']}")
+            
+            # Send emails (non-blocking)
+            try:
+                # Send booking confirmation to client
+                send_booking_confirmation_email(booking, car)
+                
+                # Send admin notification
+                send_admin_notification_email(booking, car)
+                
+                logger.info(f"Emails sent for booking SOF{booking['id'][:8].upper()}")
+            except Exception as e:
+                logger.error(f"Failed to send emails for booking SOF{booking['id'][:8].upper()}: {e}")
+                # Don't fail the booking if email fails
             
             return jsonify({
                 "success": True,
@@ -1071,7 +1290,7 @@ def create_booking():
         return jsonify({"error": str(e)}), 400
     except Exception as e:
         logger.error(f"Error creating booking: {e}")
-        return jsonify({"error": "Failed to create booking"}), 500
+        return jsonify({"error": "Failed to create booking", "details": str(e)}), 500
 
 @app.route('/bookings/<int:booking_id>', methods=['GET'])
 def get_booking(booking_id):
@@ -1106,6 +1325,71 @@ def get_booking_by_reference(booking_reference):
     except Exception as e:
         logger.error(f"Error getting booking {booking_reference}: {e}")
         return jsonify({"error": "Failed to fetch booking"}), 500
+
+@app.route('/contact/inquiry', methods=['POST'])
+def contact_inquiry():
+    """Handle contact form submissions"""
+    try:
+        # Rate limiting check
+        check_rate_limit()
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        # Validate required fields
+        required_fields = ['name', 'email', 'message']
+        for field in required_fields:
+            if field not in data or not data[field].strip():
+                return jsonify({"error": f"Missing required field: {field}"}), 400
+        
+        # Honeypot check
+        for honeypot in HONEYPOT_FIELDS:
+            if honeypot in data and data[honeypot]:
+                logger.warning(f"Honeypot field '{honeypot}' was filled from IP: {get_client_ip()}")
+                return jsonify({"error": "Invalid form submission"}), 400
+        
+        # Validate email
+        if not validate_email(data['email'].strip()):
+            return jsonify({"error": "Invalid email format"}), 400
+        
+        # Validate name (minimum 2 characters)
+        if len(data['name'].strip()) < 2:
+            return jsonify({"error": "Name must be at least 2 characters"}), 400
+        
+        # Validate message (minimum 10 characters)
+        if len(data['message'].strip()) < 10:
+            return jsonify({"error": "Message must be at least 10 characters"}), 400
+        
+        # Prepare form data
+        form_data = {
+            'name': data['name'].strip(),
+            'email': data['email'].strip().lower(),
+            'phone': data.get('phone', '').strip(),
+            'message': data['message'].strip()
+        }
+        
+        # Send email
+        email_sent = send_contact_form_email(form_data)
+        
+        if email_sent:
+            logger.info(f"Contact form submitted by {form_data['email']} from IP: {get_client_ip()}")
+            return jsonify({
+                "success": True,
+                "message": "Your message has been sent successfully. We will get back to you soon!"
+            }), 200
+        else:
+            logger.error(f"Failed to send contact form email from {form_data['email']}")
+            return jsonify({
+                "success": False,
+                "message": "Failed to send message. Please try again later."
+            }), 500
+        
+    except TooManyRequests as e:
+        return jsonify({"error": str(e)}), 429
+    except Exception as e:
+        logger.error(f"Error processing contact form: {e}")
+        return jsonify({"error": "Failed to process contact form"}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
