@@ -39,6 +39,8 @@ CORS(app,
          'https://sof-car.eu', 
          'http://localhost:3000', 
          'https://localhost:3000',
+         'http://192.168.1.7:3000',
+         'https://192.168.1.7:3000',
      ], 
      supports_credentials=True,
      allow_headers=[
@@ -109,6 +111,7 @@ ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'change_this_password')
 # EmailJS configuration
 EMAILJS_SERVICE_ID = os.environ.get('EMAILJS_SERVICE_ID')
 EMAILJS_PUBLIC_KEY = os.environ.get('EMAILJS_PUBLIC_KEY')
+EMAILJS_PRIVATE_KEY = os.environ.get('EMAILJS_PRIVATE_KEY')
 EMAILJS_CONTACT_TEMPLATE_ID = os.environ.get('EMAILJS_CONTACT_TEMPLATE_ID')
 EMAILJS_BOOKING_TEMPLATE_ID = os.environ.get('EMAILJS_BOOKING_TEMPLATE_ID')
 
@@ -121,7 +124,7 @@ SUPABASE_BUCKET = 'cars'
 rate_limit_storage = {}
 
 # Security settings
-HONEYPOT_FIELDS = ['website', 'phone_number', 'company', 'subject', 'message', 'url', 'homepage']
+HONEYPOT_FIELDS = ['website', 'phone_number', 'company', 'subject', 'url', 'homepage']
 ALLOWED_PAYMENT_METHODS = ['cash', 'card', 'bank_transfer', 'online']
 rate_limit_window = 3600  # 1 hour
 rate_limit_max_requests = 3
@@ -398,7 +401,7 @@ def calculate_total_price(car_price, start_date, end_date):
     return total_price
 
 # EmailJS Functions
-def send_emailjs_email(service_id, template_id, template_params, public_key):
+def send_emailjs_email(service_id, template_id, template_params, public_key, private_key=None):
     """Send email using EmailJS API"""
     try:
         url = "https://api.emailjs.com/api/v1.0/email/send"
@@ -409,6 +412,10 @@ def send_emailjs_email(service_id, template_id, template_params, public_key):
             "user_id": public_key,
             "template_params": template_params
         }
+        
+        # Add access token for server-side API calls if available
+        if private_key:
+            data["accessToken"] = private_key
         
         response = requests.post(url, json=data, timeout=30)
         
@@ -454,7 +461,8 @@ def send_booking_confirmation_email(booking_data, car_data):
         EMAILJS_SERVICE_ID,
         EMAILJS_BOOKING_TEMPLATE_ID,
         template_params,
-        EMAILJS_PUBLIC_KEY
+        EMAILJS_PUBLIC_KEY,
+        EMAILJS_PRIVATE_KEY
     )
 
 def send_admin_notification_email(booking_data, car_data):
@@ -494,7 +502,8 @@ ID: {booking_data['id']}
         EMAILJS_SERVICE_ID,
         EMAILJS_CONTACT_TEMPLATE_ID,  # Използваме contact template
         template_params,
-        EMAILJS_PUBLIC_KEY
+        EMAILJS_PUBLIC_KEY,
+        EMAILJS_PRIVATE_KEY
     )
 
 def send_contact_form_email(form_data):
@@ -515,7 +524,8 @@ def send_contact_form_email(form_data):
         EMAILJS_SERVICE_ID,
         EMAILJS_CONTACT_TEMPLATE_ID,
         template_params,
-        EMAILJS_PUBLIC_KEY
+        EMAILJS_PUBLIC_KEY,
+        EMAILJS_PRIVATE_KEY
     )
 
 def check_car_availability_atomic(car_id, start_date, end_date):
@@ -1217,19 +1227,15 @@ def create_booking():
                 return jsonify({"error": "Car not found"}), 404
             
             car = car_response.data[0]
-            
             # Atomic availability check
             is_available, error_msg = check_car_availability_atomic(
                 car_id, validated_data['start_date'], validated_data['end_date']
             )
-            
             if not is_available:
                 return jsonify({"error": error_msg}), 409
-            
             # Calculate total price
             total_price = calculate_total_price(car['price_per_day'], validated_data['start_date'], validated_data['end_date'])
             rental_days = (datetime.strptime(validated_data['end_date'], '%Y-%m-%d').date() - datetime.strptime(validated_data['start_date'], '%Y-%m-%d').date()).days
-            
             # Create booking with all necessary data
             booking_data = {
                 'car_id': car_id,
@@ -1251,22 +1257,18 @@ def create_booking():
             
             # Insert booking
             booking_response = supabase.table('bookings').insert(booking_data).execute()
-            
             if not booking_response.data:
                 return jsonify({"error": "Failed to create booking", "details": str(booking_response.error)}), 500
             
             booking = booking_response.data[0]
             
             logger.info(f"Booking created: SOF{booking['id'][:8].upper()} for car {car_id} by {booking['client_email']}")
-            
             # Send emails (non-blocking)
             try:
                 # Send booking confirmation to client
                 send_booking_confirmation_email(booking, car)
-                
                 # Send admin notification
                 send_admin_notification_email(booking, car)
-                
                 logger.info(f"Emails sent for booking SOF{booking['id'][:8].upper()}")
             except Exception as e:
                 logger.error(f"Failed to send emails for booking SOF{booking['id'][:8].upper()}: {e}")
@@ -1278,7 +1280,10 @@ def create_booking():
                 "message": "Booking created successfully",
                 "next_steps": "Please proceed with payment confirmation"
             }), 201
-            
+                
+        except Exception as e:
+            logger.error(f"Error in booking creation: {e}")
+            return jsonify({"error": "Failed to create booking", "details": str(e)}), 500
         finally:
             # Release lock
             if car_id in booking_locks:
@@ -1338,7 +1343,7 @@ def contact_inquiry():
             return jsonify({"error": "No data provided"}), 400
         
         # Validate required fields
-        required_fields = ['name', 'email', 'message']
+        required_fields = ['name', 'email', 'message', 'phone']
         for field in required_fields:
             if field not in data or not data[field].strip():
                 return jsonify({"error": f"Missing required field: {field}"}), 400
@@ -1365,7 +1370,7 @@ def contact_inquiry():
         form_data = {
             'name': data['name'].strip(),
             'email': data['email'].strip().lower(),
-            'phone': data.get('phone', '').strip(),
+            'phone': data['phone'].strip(),
             'message': data['message'].strip()
         }
         
