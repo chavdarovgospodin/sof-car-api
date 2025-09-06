@@ -457,6 +457,14 @@ def send_booking_confirmation_email(booking_data, car_data):
     end_date = datetime.strptime(booking_data['end_date'], '%Y-%m-%d').date()
     rental_days = (end_date - start_date).days
     
+    # Calculate BGN values (assuming prices are stored in BGN)
+    total_price_bgn = booking_data['total_price']
+    deposit_amount_bgn = booking_data['deposit_amount']
+    
+    # Calculate EUR equivalents (approximate conversion rate 1.96)
+    total_price_eur = round(total_price_bgn / 1.96, 2)
+    deposit_amount_eur = round(deposit_amount_bgn / 1.96, 2)
+    
     template_params = {
         "name": f"{booking_data['client_first_name']} {booking_data['client_last_name']}",
         "email": booking_data['client_email'],
@@ -470,8 +478,8 @@ def send_booking_confirmation_email(booking_data, car_data):
         "start_date": booking_data['start_date'],
         "end_date": booking_data['end_date'],
         "rental_days": rental_days,
-        "total_price": booking_data['total_price'],
-        "deposit_amount": booking_data['deposit_amount'],
+        "total_price": f"{total_price_bgn:.2f} лв / ≈{total_price_eur:.2f} €",
+        "deposit_amount": f"{deposit_amount_bgn:.2f} лв / ≈{deposit_amount_eur:.2f} €",
         "payment_method": booking_data['payment_method']
     }
     
