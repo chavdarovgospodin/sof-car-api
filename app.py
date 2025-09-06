@@ -347,16 +347,20 @@ def validate_booking_data(data):
         if start_date >= end_date:
             raise BadRequest("Start date must be before end date")
         
-        if start_date < today:
-            raise BadRequest("Start date cannot be in the past")
+        if start_date <= today:
+            raise BadRequest("Start date must be from tomorrow onwards")
+        
+        # Minimum rental period (5 days)
+        if (end_date - start_date).days < 5:
+            raise BadRequest("Minimum rental period is 5 days")
         
         # Maximum rental period (30 days)
         if (end_date - start_date).days > 30:
             raise BadRequest("Maximum rental period is 30 days")
         
-        # Cannot book too far in advance (1 year)
-        if (start_date - today).days > 365:
-            raise BadRequest("Cannot book more than 1 year in advance")
+        # Cannot book too far in advance (3 months)
+        if (start_date - today).days > 90:
+            raise BadRequest("Cannot book more than 3 months in advance")
             
     except ValueError:
         raise BadRequest("Invalid date format. Use YYYY-MM-DD")
@@ -442,6 +446,9 @@ def send_booking_confirmation_email(booking_data, car_data):
     rental_days = (end_date - start_date).days
     
     template_params = {
+        "name": f"{booking_data['client_first_name']} {booking_data['client_last_name']}",
+        "email": booking_data['client_email'],
+        "phone": booking_data['client_phone'],
         "client_name": f"{booking_data['client_first_name']} {booking_data['client_last_name']}",
         "client_email": booking_data['client_email'],
         "booking_reference": f"SOF{booking_data['id'][:8].upper()}",  # Use booking ID as reference
@@ -453,8 +460,7 @@ def send_booking_confirmation_email(booking_data, car_data):
         "rental_days": rental_days,
         "total_price": booking_data['total_price'],
         "deposit_amount": booking_data['deposit_amount'],
-        "payment_method": booking_data['payment_method'],
-        "to_name": f"{booking_data['client_first_name']} {booking_data['client_last_name']}"
+        "payment_method": booking_data['payment_method']
     }
     
     return send_emailjs_email(
@@ -609,16 +615,18 @@ def admin_status():
 def admin_get_cars():
     """Get all cars for admin (including inactive)"""
     try:
+        logger.info(f"Admin {session.get('admin_username')} requesting cars list")
+        
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
-        response = supabase.table('cars').select('*').order('created_at', desc=True).execute()
+        response = supabase_admin.table('cars').select('*').order('created_at', desc=True).execute()
         cars = response.data
-        
-        # Няма нужда от отделни image queries
         
         total_cars = len(cars)
         active_cars = len([car for car in cars if car.get('is_active', True)])
+        
+        logger.info(f"Retrieved {total_cars} cars for admin (active: {active_cars}, inactive: {total_cars - active_cars})")
         
         return jsonify({
             "cars": cars,
@@ -637,6 +645,8 @@ def admin_get_cars():
 def admin_create_car():
     """Create new car with optional single image upload"""
     try:
+        logger.info(f"Admin {session.get('admin_username')} creating new car")
+        
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
@@ -685,7 +695,7 @@ def admin_create_car():
                 validate_image_file(uploaded_image)
                 
                 # Create car first
-                car_response = supabase.table('cars').insert(validated_data).execute()
+                car_response = supabase_admin.table('cars').insert(validated_data).execute()
                 if not car_response.data:
                     return jsonify({"error": "Failed to create car"}), 500
                 
@@ -695,7 +705,7 @@ def admin_create_car():
                 # Upload image and update car
                 image_url = upload_image_simple(uploaded_image, car_id)
                 
-                update_response = supabase.table('cars').update({
+                update_response = supabase_admin.table('cars').update({
                     'image_url': image_url,
                     'updated_at': datetime.now().isoformat()
                 }).eq('id', car_id).execute()
@@ -707,13 +717,20 @@ def admin_create_car():
                 
             except Exception as e:
                 logger.error(f"Image upload failed: {e}")
-                return jsonify({"error": f"Car created but image upload failed: {str(e)}"}), 201
+                # Delete the created car since image upload failed
+                try:
+                    supabase_admin.table('cars').delete().eq('id', car_id).execute()
+                    logger.info(f"Deleted car {car_id} due to image upload failure")
+                except Exception as delete_error:
+                    logger.error(f"Failed to delete car {car_id} after image upload failure: {delete_error}")
+                return jsonify({"error": f"Image upload failed: {str(e)}"}), 400
         else:
             # Create car without image
-            car_response = supabase.table('cars').insert(validated_data).execute()
+            car_response = supabase_admin.table('cars').insert(validated_data).execute()
             if not car_response.data:
                 return jsonify({"error": "Failed to create car"}), 500
             car = car_response.data[0]
+            car_id = car['id']
             logger.info(f"Car created without image: {car['brand']} {car['model']} (ID: {car_id})")
         
         return jsonify({
@@ -733,6 +750,8 @@ def admin_create_car():
 def admin_update_car(car_id):
     """Update existing car with optional image upload/replacement"""
     try:
+        logger.info(f"Admin {session.get('admin_username')} updating car {car_id}")
+        
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
@@ -812,7 +831,7 @@ def admin_update_car(car_id):
         if update_data:
             update_data['updated_at'] = datetime.now().isoformat()
             
-            car_response = supabase.table('cars').update(update_data).eq('id', car_id).execute()
+            car_response = supabase_admin.table('cars').update(update_data).eq('id', car_id).execute()
             if not car_response.data:
                 return jsonify({"error": "Failed to update car"}), 500
             
@@ -839,6 +858,8 @@ def admin_update_car(car_id):
 def admin_delete_car(car_id):
     """Delete car and its image"""
     try:
+        logger.info(f"Admin {session.get('admin_username')} attempting to delete car {car_id}")
+        
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
@@ -863,10 +884,15 @@ def admin_delete_car(car_id):
         if car.get('image_url'):
             delete_image_simple(car['image_url'])
         
-        # Delete car record
-        car_delete_response = supabase.table('cars').delete().eq('id', car_id).execute()
-        if not car_delete_response.data:
-            return jsonify({"error": "Failed to delete car"}), 500
+        # Delete car record using admin client (service role key)
+        car_delete_response = supabase_admin.table('cars').delete().eq('id', car_id).execute()
+        
+        # Verify deletion by checking if car still exists
+        verify_response = supabase_admin.table('cars').select('id').eq('id', car_id).execute()
+        
+        if verify_response.data:
+            logger.error(f"Car {car_id} still exists after delete operation")
+            return jsonify({"error": "Failed to delete car - car still exists"}), 500
         
         logger.info(f"Car deleted by admin {session['admin_username']}: {car['brand']} {car['model']} (ID: {car_id})")
         
@@ -885,6 +911,8 @@ def admin_delete_car(car_id):
 def admin_update_booking(booking_id):
     """Update booking - only status, deposit_status, and notes allowed"""
     try:
+        logger.info(f"Admin {session.get('admin_username')} updating booking {booking_id}")
+        
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
@@ -998,6 +1026,8 @@ def admin_update_booking(booking_id):
 def admin_get_bookings():
     """Get all bookings for admin with filtering options"""
     try:
+        logger.info(f"Admin {session.get('admin_username')} requesting bookings list")
+        
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
@@ -1102,22 +1132,66 @@ def root():
 
 @app.route('/cars', methods=['GET'])
 def get_cars():
-    """Get all available cars withhout filtering"""
+    """Get available cars with mandatory date filtering"""
     try:
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
-        query = supabase.table('cars').select('*')
+        # Get query parameters - these are now mandatory
+        start_date = request.args.get('start_date')
+        end_date = request.args.get('end_date')
+        car_class = request.args.get('class')
+        
+        # Validate required parameters
+        if not start_date or not end_date:
+            return jsonify({"error": "start_date and end_date are required parameters"}), 400
+        
+        # Get all active cars
+        query = supabase.table('cars').select('*').eq('is_active', True)
+        
+        if car_class:
+            query = query.eq('class', car_class)
         
         response = query.order('brand').execute()
-        cars = response.data
+        all_cars = response.data
+        
+        # Filter cars by availability for the requested dates
+        available_cars = []
+        for car in all_cars:
+            is_available, _ = check_car_availability_atomic(car['id'], start_date, end_date)
+            if is_available:
+                available_cars.append(car)
+        
+        logger.info(f"Found {len(available_cars)} available cars out of {len(all_cars)} total cars for dates {start_date} to {end_date}")
         
         return jsonify({
-            "cars": cars,
+            "cars": available_cars,
+            "total": len(available_cars)
         })
     except Exception as e:
         logger.error(f"Error getting cars: {e}")
         return jsonify({"error": "Failed to fetch cars"}), 500
+
+@app.route('/cars/all', methods=['GET'])
+def get_all_cars():
+    """Get all cars (active and inactive) without any filtering"""
+    try:
+        if not supabase:
+            return jsonify({"error": "Database not available"}), 503
+        
+        # Get all cars without any filtering
+        response = supabase.table('cars').select('*').order('brand').execute()
+        all_cars = response.data
+        
+        logger.info(f"Returning all {len(all_cars)} cars (active and inactive)")
+        
+        return jsonify({
+            "cars": all_cars,
+            "total": len(all_cars)
+        })
+    except Exception as e:
+        logger.error(f"Error getting all cars: {e}")
+        return jsonify({"error": "Failed to fetch all cars"}), 500
 
 @app.route('/cars/<car_id>', methods=['GET'])
 def get_car(car_id):
@@ -1227,15 +1301,18 @@ def create_booking():
                 return jsonify({"error": "Car not found"}), 404
             
             car = car_response.data[0]
+            
             # Atomic availability check
             is_available, error_msg = check_car_availability_atomic(
                 car_id, validated_data['start_date'], validated_data['end_date']
             )
             if not is_available:
                 return jsonify({"error": error_msg}), 409
+            
             # Calculate total price
             total_price = calculate_total_price(car['price_per_day'], validated_data['start_date'], validated_data['end_date'])
             rental_days = (datetime.strptime(validated_data['end_date'], '%Y-%m-%d').date() - datetime.strptime(validated_data['start_date'], '%Y-%m-%d').date()).days
+            
             # Create booking with all necessary data
             booking_data = {
                 'car_id': car_id,
