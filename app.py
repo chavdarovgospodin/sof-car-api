@@ -127,7 +127,7 @@ rate_limit_storage = {}
 HONEYPOT_FIELDS = ['website', 'phone_number', 'company', 'subject', 'url', 'homepage']
 ALLOWED_PAYMENT_METHODS = ['cash', 'card', 'bank_transfer', 'online']
 rate_limit_window = 3600  # 1 hour
-rate_limit_max_requests = 3
+rate_limit_max_requests = 5
 
 # Concurrency protection
 booking_locks = {}  # Simple in-memory locks per car_id
