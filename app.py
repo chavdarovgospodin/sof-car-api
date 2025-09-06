@@ -233,7 +233,7 @@ def check_rate_limit():
     # Check if limit exceeded
     if rate_limit_storage[client_ip]['count'] >= rate_limit_max_requests:
         logger.warning(f"Rate limit exceeded for IP: {client_ip}")
-        raise TooManyRequests("Rate limit exceeded. Maximum 3 bookings per hour per IP.")
+        raise TooManyRequests("Rate limit exceeded. Maximum 5 bookings per hour per IP.")
     
     # Increment counter
     rate_limit_storage[client_ip]['count'] += 1
