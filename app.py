@@ -104,6 +104,17 @@ except Exception as e:
     supabase = None
     supabase_admin = None
 
+# Helper function to create admin client
+def get_admin_client():
+    """Create admin client with service role key to bypass RLS"""
+    try:
+        return create_client(
+            os.environ.get('SUPABASE_URL'),
+            os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
+        )
+    except Exception as e:
+        logger.error(f"Failed to create admin client: {e}")
+        raise
 
 # Admin credentials from environment
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
@@ -629,7 +640,7 @@ def admin_get_cars():
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
-        response = supabase_admin.table('cars').select('*').order('created_at', desc=True).execute()
+        response = get_admin_client().table('cars').select('*').order('created_at', desc=True).execute()
         cars = response.data
         
         total_cars = len(cars)
@@ -704,7 +715,7 @@ def admin_create_car():
                 validate_image_file(uploaded_image)
                 
                 # Create car first
-                car_response = supabase_admin.table('cars').insert(validated_data).execute()
+                car_response = get_admin_client().table('cars').insert(validated_data).execute()
                 if not car_response.data:
                     return jsonify({"error": "Failed to create car"}), 500
                 
@@ -714,7 +725,7 @@ def admin_create_car():
                 # Upload image and update car
                 image_url = upload_image_simple(uploaded_image, car_id)
                 
-                update_response = supabase_admin.table('cars').update({
+                update_response = get_admin_client().table('cars').update({
                     'image_url': image_url,
                     'updated_at': datetime.now().isoformat()
                 }).eq('id', car_id).execute()
@@ -728,14 +739,14 @@ def admin_create_car():
                 logger.error(f"Image upload failed: {e}")
                 # Delete the created car since image upload failed
                 try:
-                    supabase_admin.table('cars').delete().eq('id', car_id).execute()
+                    get_admin_client().table('cars').delete().eq('id', car_id).execute()
                     logger.info(f"Deleted car {car_id} due to image upload failure")
                 except Exception as delete_error:
                     logger.error(f"Failed to delete car {car_id} after image upload failure: {delete_error}")
                 return jsonify({"error": f"Image upload failed: {str(e)}"}), 400
         else:
             # Create car without image
-            car_response = supabase_admin.table('cars').insert(validated_data).execute()
+            car_response = get_admin_client().table('cars').insert(validated_data).execute()
             if not car_response.data:
                 return jsonify({"error": "Failed to create car"}), 500
             car = car_response.data[0]
@@ -770,7 +781,7 @@ def admin_update_car(car_id):
             return jsonify({"error": "Invalid car ID format"}), 400
         
         # Check if car exists using admin client
-        existing_car_response = supabase_admin.table('cars').select('*').eq('id', car_id).execute()
+        existing_car_response = get_admin_client().table('cars').select('*').eq('id', car_id).execute()
         if not existing_car_response.data:
             return jsonify({"error": "Car not found"}), 404
         
@@ -840,7 +851,7 @@ def admin_update_car(car_id):
         if update_data:
             update_data['updated_at'] = datetime.now().isoformat()
             
-            car_response = supabase_admin.table('cars').update(update_data).eq('id', car_id).execute()
+            car_response = get_admin_client().table('cars').update(update_data).eq('id', car_id).execute()
             if not car_response.data:
                 return jsonify({"error": "Failed to update car"}), 500
             
@@ -878,14 +889,14 @@ def admin_delete_car(car_id):
             return jsonify({"error": "Invalid car ID format"}), 400
         
         # Check if car exists using admin client
-        existing_car_response = supabase_admin.table('cars').select('*').eq('id', car_id).execute()
+        existing_car_response = get_admin_client().table('cars').select('*').eq('id', car_id).execute()
         if not existing_car_response.data:
             return jsonify({"error": "Car not found"}), 404
         
         car = existing_car_response.data[0]
         
         # Check for existing bookings using admin client
-        bookings_response = supabase_admin.table('bookings').select('id').eq('car_id', car_id).in_('status', ['confirmed', 'pending']).execute()
+        bookings_response = get_admin_client().table('bookings').select('id').eq('car_id', car_id).in_('status', ['confirmed', 'pending']).execute()
         if bookings_response.data:
             return jsonify({"error": "Cannot delete car with existing bookings"}), 409
         
@@ -894,10 +905,10 @@ def admin_delete_car(car_id):
             delete_image_simple(car['image_url'])
         
         # Delete car record using admin client (service role key)
-        car_delete_response = supabase_admin.table('cars').delete().eq('id', car_id).execute()
+        car_delete_response = get_admin_client().table('cars').delete().eq('id', car_id).execute()
         
         # Verify deletion by checking if car still exists
-        verify_response = supabase_admin.table('cars').select('id').eq('id', car_id).execute()
+        verify_response = get_admin_client().table('cars').select('id').eq('id', car_id).execute()
         
         if verify_response.data:
             logger.error(f"Car {car_id} still exists after delete operation")
@@ -931,7 +942,7 @@ def admin_update_booking(booking_id):
             return jsonify({"error": "Invalid booking ID format"}), 400
         
         # Check if booking exists using admin client
-        existing_booking_response = supabase_admin.table('bookings').select('*').eq('id', booking_id).execute()
+        existing_booking_response = get_admin_client().table('bookings').select('*').eq('id', booking_id).execute()
         if not existing_booking_response.data:
             return jsonify({"error": "Booking not found"}), 404
         
@@ -971,7 +982,7 @@ def admin_update_booking(booking_id):
         logger.info(f"Updating booking {booking_id} with data: {update_data}")
         
         # Use admin client for update operations (bypasses RLS)
-        admin_client = supabase_admin
+        admin_client = get_admin_client()
         
         try:
             # Try update with admin client
@@ -1043,7 +1054,7 @@ def admin_delete_booking(booking_id):
             return jsonify({"error": "Invalid request. Expected status: 'deleted'"}), 400
         
         # Check if booking exists using admin client
-        existing_booking_response = supabase_admin.table('bookings').select('*').eq('id', booking_id).execute()
+        existing_booking_response = get_admin_client().table('bookings').select('*').eq('id', booking_id).execute()
         if not existing_booking_response.data:
             logger.warning(f"Booking {booking_id} not found")
             return jsonify({"error": "Booking not found"}), 404
@@ -1056,7 +1067,7 @@ def admin_delete_booking(booking_id):
             return jsonify({"error": "Booking is already deleted"}), 400
         
         # Use admin client for update (bypasses RLS)
-        admin_client = supabase_admin
+        admin_client = get_admin_client()
         
         # Soft delete by setting status to 'deleted'
         update_data = {
@@ -1110,7 +1121,7 @@ def admin_get_bookings():
         offset = request.args.get('offset', 0)
         
         # Build query using admin client
-        query = supabase_admin.table('bookings').select('*, cars(brand, model, year, class)')
+        query = get_admin_client().table('bookings').select('*, cars(brand, model, year, class)')
         
         # Apply filters
         if status:
@@ -1146,7 +1157,7 @@ def admin_get_bookings():
         bookings = response.data
         
         # Get summary statistics using admin client
-        stats_query = supabase_admin.table('bookings').select('status, total_price')
+        stats_query = get_admin_client().table('bookings').select('status, total_price')
         if start_date:
             stats_query = stats_query.gte('start_date', start_date)
         if end_date:
