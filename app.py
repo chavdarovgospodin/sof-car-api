@@ -1021,6 +1021,70 @@ def admin_update_booking(booking_id):
         logger.error(f"Error updating booking {booking_id}: {e}")
         return jsonify({"error": "Failed to update booking"}), 500
 
+@app.route('/admin/bookings/<booking_id>', methods=['PATCH'])
+@admin_required
+def admin_delete_booking(booking_id):
+    """Soft delete a booking by setting status to 'deleted'"""
+    try:
+        logger.info(f"Admin {session.get('admin_username')} attempting to soft delete booking {booking_id}")
+        
+        # Get request data
+        data = request.get_json()
+        if not data or data.get('status') != 'deleted':
+            return jsonify({"error": "Invalid request. Expected status: 'deleted'"}), 400
+        
+        # Check if booking exists
+        existing_booking_response = supabase.table('bookings').select('*').eq('id', booking_id).execute()
+        if not existing_booking_response.data:
+            logger.warning(f"Booking {booking_id} not found")
+            return jsonify({"error": "Booking not found"}), 404
+        
+        existing_booking = existing_booking_response.data[0]
+        
+        # Check if already deleted
+        if existing_booking.get('status') == 'deleted':
+            logger.warning(f"Booking {booking_id} is already deleted")
+            return jsonify({"error": "Booking is already deleted"}), 400
+        
+        # Use admin client for update (bypasses RLS)
+        admin_client = create_client(
+            os.environ.get('SUPABASE_URL'),
+            os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
+        )
+        
+        # Soft delete by setting status to 'deleted'
+        update_data = {
+            'status': 'deleted',
+            'updated_at': datetime.now().isoformat()
+        }
+        
+        update_response = admin_client.table('bookings').update(update_data).eq('id', booking_id).execute()
+        
+        if not update_response.data:
+            logger.error(f"Failed to delete booking {booking_id} - no data returned")
+            return jsonify({"error": "Failed to delete booking"}), 500
+        
+        # Verify the update
+        booking_response = admin_client.table('bookings').select('*').eq('id', booking_id).execute()
+        if not booking_response.data or booking_response.data[0].get('status') != 'deleted':
+            logger.error(f"Delete verification failed for booking {booking_id}")
+            return jsonify({"error": "Delete failed - booking status was not updated to deleted"}), 500
+        
+        deleted_booking = booking_response.data[0]
+        
+        logger.info(f"Successfully soft deleted booking {booking_id}")
+        logger.info(f"Booking soft deleted by admin {session['admin_username']}: Booking ID {booking_id}")
+        
+        return jsonify({
+            "success": True,
+            "booking": deleted_booking,
+            "message": "Booking soft deleted successfully"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error deleting booking {booking_id}: {e}")
+        return jsonify({"error": "Failed to delete booking"}), 500
+
 @app.route('/admin/bookings', methods=['GET'])
 @admin_required
 def admin_get_bookings():
@@ -1318,6 +1382,7 @@ def create_booking():
                 'car_id': car_id,
                 'start_date': validated_data['start_date'],
                 'end_date': validated_data['end_date'],
+                'rental_days': rental_days,
                 'client_last_name': validated_data['client_last_name'].strip(),
                 'client_first_name': validated_data['client_first_name'].strip(),
                 'client_email': validated_data['client_email'].strip().lower(),
