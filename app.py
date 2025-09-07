@@ -37,6 +37,7 @@ app.config.update(
 CORS(app, 
      origins=[
          'https://sof-car.eu', 
+         'https://sof-car-nextjs.vercel.app', 
          'http://localhost:3000', 
          'https://localhost:3000',
          'http://192.168.1.7:3000',
