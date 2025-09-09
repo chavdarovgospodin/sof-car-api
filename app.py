@@ -109,10 +109,21 @@ except Exception as e:
 def get_admin_client():
     """Create admin client with service role key to bypass RLS"""
     try:
-        return create_client(
-            os.environ.get('SUPABASE_URL'),
-            os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
-        )
+        supabase_url = os.environ.get('SUPABASE_URL')
+        supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
+        
+        # Debug logging
+        logger.info(f"Creating admin client with service role")
+        logger.info(f"URL present: {bool(supabase_url)}")
+        logger.info(f"Service key present: {bool(supabase_key)}")
+        
+        if not supabase_url or not supabase_key:
+            logger.error(f"Missing Supabase credentials - URL: {bool(supabase_url)}, Key: {bool(supabase_key)}")
+            raise Exception("Missing Supabase environment variables")
+        
+        client = create_client(supabase_url, supabase_key)
+        logger.info("Admin client created successfully with service role key")
+        return client
     except Exception as e:
         logger.error(f"Failed to create admin client: {e}")
         raise
@@ -153,65 +164,213 @@ def get_client_ip():
 
 def allowed_file(filename):
     """Check if uploaded file is allowed"""
+    if not filename:
+        return False
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def validate_image_file(file):
     """Validate uploaded image file"""
-    if not file or file.filename == '':
-        raise BadRequest("No file selected")
-    
-    if not allowed_file(file.filename):
-        raise BadRequest(f"File type not allowed. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}")
-    
-    # Check file size (Flask doesn't automatically enforce this)
-    file.seek(0, os.SEEK_END)
-    file_length = file.tell()
-    file.seek(0)  # Reset file pointer
-    
-    if file_length > MAX_FILE_SIZE:
-        raise BadRequest(f"File size too large. Maximum size: {MAX_FILE_SIZE/1024/1024:.1f}MB")
-    
-    return True
+    try:
+        logger.debug(f"Validating file: {file.filename}")
+        
+        if not file or not hasattr(file, 'filename') or file.filename == '':
+            raise BadRequest("No file selected")
+        
+        # Check if it's actually a file object
+        if not hasattr(file, 'seek') or not hasattr(file, 'tell') or not hasattr(file, 'read'):
+            logger.error(f"Invalid file object: {type(file)}")
+            raise BadRequest("Invalid file object")
+        
+        # Check file extension
+        if not allowed_file(file.filename):
+            raise BadRequest(f"File type not allowed. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}")
+        
+        # Check file size
+        file.seek(0, os.SEEK_END)
+        file_length = file.tell()
+        file.seek(0)  # Reset file pointer
+        
+        logger.debug(f"File size: {file_length} bytes")
+        if file_length > MAX_FILE_SIZE:
+            raise BadRequest(f"File size too large. Maximum size: {MAX_FILE_SIZE/1024/1024:.1f}MB")
+        
+        if file_length == 0:
+            raise BadRequest("File is empty")
+        
+        logger.debug(f"File validation passed for: {file.filename}")
+        return True
+        
+    except BadRequest:
+        raise
+    except Exception as e:
+        logger.error(f"Error validating file: {e}")
+        raise BadRequest(f"Error validating file: {str(e)}")
+
 
 def upload_image_simple(file, car_id):
-    """Upload image and return just the URL"""
+    """Upload single image and return URL - Alternative version"""
     try:
         file_ext = file.filename.rsplit('.', 1)[1].lower()
         timestamp = int(time.time())
-        filename = f"car_{car_id}_{timestamp}_{uuid.uuid4().hex[:8]}.{file_ext}"
+        unique_id = uuid.uuid4().hex[:8]
+        filename = f"car_{car_id}_{timestamp}_{unique_id}.{file_ext}"
         
+        # Read file content
         file_content = file.read()
         file.seek(0)
         
-        response = supabase.storage.from_(SUPABASE_BUCKET).upload(
-            filename, 
-            file_content,
-            file_options={
-                "content-type": mimetypes.guess_type(file.filename)[0] or 'image/jpeg',
-                "upsert": False
-            }
+        # Use admin client for upload
+        admin_client = get_admin_client()
+        
+        # Simple upload without options
+        response = admin_client.storage.from_(SUPABASE_BUCKET).upload(
+            filename,
+            file_content
         )
         
-        if response.status_code != 200:
-            raise Exception("Failed to upload image to storage")
+        # Get public URL
+        public_url = admin_client.storage.from_(SUPABASE_BUCKET).get_public_url(filename)
         
-        return supabase.storage.from_(SUPABASE_BUCKET).get_public_url(filename)
+        logger.info(f"Successfully uploaded image: {filename} -> {public_url}")
+        return public_url
         
     except Exception as e:
-        logger.error(f"Error uploading image: {e}")
+        logger.error(f"Error uploading image: {e}", exc_info=True)
         raise Exception(f"Failed to upload image: {str(e)}")
 
+def upload_multiple_images(files, car_id):
+    """Upload multiple images and return array of URLs"""
+    try:
+        uploaded_urls = []
+        
+        # Filter out empty files and validate
+        valid_files = []
+        for file in files:
+            # Check if it's actually a file object with required attributes
+            if (file and 
+                hasattr(file, 'filename') and 
+                hasattr(file, 'read') and 
+                hasattr(file, 'seek') and
+                file.filename and 
+                file.filename.strip()):
+                valid_files.append(file)
+                logger.debug(f"Valid file found: {file.filename}")
+            else:
+                logger.debug(f"Skipping invalid file object: {type(file)}")
+        
+        if not valid_files:
+            logger.warning("No valid files provided for upload")
+            return []
+        
+        # Upload each file
+        for file in valid_files:
+            try:
+                logger.info(f"Processing file: {file.filename}")
+                validate_image_file(file)
+                image_url = upload_image_simple(file, car_id)
+                uploaded_urls.append(image_url)
+                logger.info(f"Successfully uploaded: {file.filename}")
+            except Exception as file_error:
+                logger.error(f"Failed to upload {file.filename}: {file_error}")
+                # Clean up any successfully uploaded images before failing
+                for url in uploaded_urls:
+                    try:
+                        delete_image_simple(url)
+                    except:
+                        pass
+                raise Exception(f"Failed to upload {file.filename}: {str(file_error)}")
+        
+        logger.info(f"Successfully uploaded {len(uploaded_urls)} images")
+        return uploaded_urls
+        
+    except Exception as e:
+        logger.error(f"Error in upload_multiple_images: {e}")
+        raise
+
+
 def delete_image_simple(image_url):
-    """Delete image from storage by URL"""
+    """Delete image from storage by URL - FIXED VERSION"""
     try:
         if not image_url:
+            logger.warning("No image URL provided for deletion")
             return True
-        filename = image_url.split('/')[-1]
-        supabase.storage.from_(SUPABASE_BUCKET).remove([filename])
-        return True
+        
+        # Extract filename from URL
+        # Expected format: https://[project].supabase.co/storage/v1/object/public/cars/filename.ext
+        # OR: https://[project].supabase.co/storage/v1/object/sign/cars/filename.ext?token=...
+        
+        # Parse the URL to get the filename
+        if '/storage/v1/object/' in image_url:
+            # Split by the storage path
+            parts = image_url.split('/storage/v1/object/')
+            if len(parts) > 1:
+                # Get everything after 'public/cars/' or 'sign/cars/'
+                path_part = parts[1]
+                
+                # Remove 'public/' or 'sign/' prefix
+                if path_part.startswith('public/'):
+                    path_part = path_part[7:]  # Remove 'public/'
+                elif path_part.startswith('sign/'):
+                    path_part = path_part[5:]  # Remove 'sign/'
+                
+                # Remove bucket name and get filename
+                if path_part.startswith(f'{SUPABASE_BUCKET}/'):
+                    filename = path_part[len(SUPABASE_BUCKET) + 1:]
+                    
+                    # Remove any query parameters (for signed URLs)
+                    if '?' in filename:
+                        filename = filename.split('?')[0]
+                else:
+                    # Fallback to simple extraction
+                    filename = image_url.split('/')[-1].split('?')[0]
+            else:
+                filename = image_url.split('/')[-1].split('?')[0]
+        else:
+            # Fallback: just get the last part of the URL
+            filename = image_url.split('/')[-1].split('?')[0]
+        
+        if not filename:
+            logger.error(f"Could not extract filename from URL: {image_url}")
+            return False
+        
+        logger.info(f"Attempting to delete file: {filename} from bucket: {SUPABASE_BUCKET}")
+        
+        # Use admin client with service role key for deletion
+        admin_client = get_admin_client()
+        
+        # Delete from storage - note the list format
+        try:
+            result = admin_client.storage.from_(SUPABASE_BUCKET).remove([filename])
+            
+            # Log the result
+            logger.info(f"Delete operation completed for: {filename}")
+            logger.debug(f"Delete result: {result}")
+            
+            # Verify deletion by checking if file still exists
+            try:
+                files = admin_client.storage.from_(SUPABASE_BUCKET).list()
+                file_exists = any(f['name'] == filename for f in (files or []))
+                
+                if not file_exists:
+                    logger.info(f"Confirmed: File {filename} successfully deleted from storage")
+                    return True
+                else:
+                    logger.warning(f"File {filename} still exists after delete attempt")
+                    return False
+                    
+            except Exception as verify_error:
+                logger.warning(f"Could not verify deletion: {verify_error}")
+                # Assume success if we can't verify
+                return True
+                
+        except Exception as delete_error:
+            logger.error(f"Delete operation failed: {delete_error}")
+            return False
+        
     except Exception as e:
-        logger.warning(f"Failed to delete image: {e}")
-        return False
+        logger.error(f"Error in delete_image_simple for URL {image_url}: {e}")
+        # Return True to not block other operations
+        return True
 
 # Admin Authentication Decorator
 def admin_required(f):
@@ -631,6 +790,7 @@ def admin_status():
         'session_expires': (datetime.fromisoformat(session.get('admin_login_time', datetime.now().isoformat())) + timedelta(hours=8)).isoformat()
     })
 
+
 @app.route('/admin/cars', methods=['GET'])
 @admin_required
 def admin_get_cars():
@@ -693,13 +853,13 @@ def admin_create_car():
                 else:
                     car_data[key] = value
             
-            uploaded_image = request.files.get('image')
+            uploaded_images = request.files.getlist('images')
         else:
             # Handle JSON data
             car_data = request.get_json()
             if not car_data:
                 return jsonify({"error": "No data provided"}), 400
-            uploaded_image = None
+            uploaded_images = []
         
         # Validate car data
         validated_data = validate_car_data(car_data)
@@ -711,10 +871,8 @@ def admin_create_car():
         validated_data['updated_at'] = datetime.now().isoformat()
         
         # Handle image upload if provided
-        if uploaded_image and uploaded_image.filename:
+        if uploaded_images and any(img.filename for img in uploaded_images):
             try:
-                validate_image_file(uploaded_image)
-                
                 # Create car first
                 car_response = get_admin_client().table('cars').insert(validated_data).execute()
                 if not car_response.data:
@@ -723,18 +881,18 @@ def admin_create_car():
                 car = car_response.data[0]
                 car_id = car['id']
                 
-                # Upload image and update car
-                image_url = upload_image_simple(uploaded_image, car_id)
+                # Upload multiple images and update car
+                image_urls = upload_multiple_images(uploaded_images, car_id)
                 
                 update_response = get_admin_client().table('cars').update({
-                    'image_url': image_url,
+                    'image_urls': image_urls,
                     'updated_at': datetime.now().isoformat()
                 }).eq('id', car_id).execute()
                 
                 if update_response.data:
                     car = update_response.data[0]
                 
-                logger.info(f"Car created with image: {car['brand']} {car['model']} (ID: {car_id})")
+                logger.info(f"Car created with {len(image_urls)} images: {car['brand']} {car['model']} (ID: {car_id})")
                 
             except Exception as e:
                 logger.error(f"Image upload failed: {e}")
@@ -746,13 +904,13 @@ def admin_create_car():
                     logger.error(f"Failed to delete car {car_id} after image upload failure: {delete_error}")
                 return jsonify({"error": f"Image upload failed: {str(e)}"}), 400
         else:
-            # Create car without image
+            # Create car without images
             car_response = get_admin_client().table('cars').insert(validated_data).execute()
             if not car_response.data:
                 return jsonify({"error": "Failed to create car"}), 500
             car = car_response.data[0]
             car_id = car['id']
-            logger.info(f"Car created without image: {car['brand']} {car['model']} (ID: {car_id})")
+            logger.info(f"Car created without images: {car['brand']} {car['model']} (ID: {car_id})")
         
         return jsonify({
             "success": True,
@@ -776,19 +934,20 @@ def admin_update_car(car_id):
         if not supabase:
             return jsonify({"error": "Database not available"}), 503
         
+        # Validate car_id format
         try:
             uuid.UUID(car_id)
         except ValueError:
             return jsonify({"error": "Invalid car ID format"}), 400
         
-        # Check if car exists using admin client
-        existing_car_response = get_admin_client().table('cars').select('*').eq('id', car_id).execute()
+        # Check if car exists
+        existing_car_response = supabase.table('cars').select('*').eq('id', car_id).execute()
         if not existing_car_response.data:
             return jsonify({"error": "Car not found"}), 404
         
         existing_car = existing_car_response.data[0]
         
-        # Handle multipart/form-data for file upload
+        # Parse request data based on content type
         if request.content_type and request.content_type.startswith('multipart/form-data'):
             car_data = {}
             
@@ -800,6 +959,12 @@ def admin_update_car(car_id):
                         car_data[key] = json.loads(value)
                     except json.JSONDecodeError:
                         car_data[key] = [feature.strip() for feature in value.split(',') if feature.strip()]
+                elif key == 'image_urls' and value:
+                    # Parse image_urls from frontend
+                    try:
+                        car_data[key] = json.loads(value) if value != 'null' else []
+                    except json.JSONDecodeError:
+                        car_data[key] = []
                 elif key in ['year', 'price_per_day', 'deposit_amount']:
                     try:
                         car_data[key] = float(value) if key in ['price_per_day', 'deposit_amount'] else int(value)
@@ -810,57 +975,119 @@ def admin_update_car(car_id):
                 else:
                     car_data[key] = value
             
-            uploaded_image = request.files.get('image')
+            # Get uploaded files
+            uploaded_images = request.files.getlist('images') or []
+            uploaded_images = [img for img in uploaded_images if img and img.filename]  # Filter empty files
         else:
             # Handle JSON data
             car_data = request.get_json()
             if not car_data:
                 return jsonify({"error": "No data provided"}), 400
-            uploaded_image = None
+            uploaded_images = []
         
-        # Remove empty fields
-        car_data = {k: v for k, v in car_data.items() if v is not None and v != ''}
+        # Remove empty fields (but keep image_urls even if empty array)
+        car_data = {k: v for k, v in car_data.items() 
+                   if v is not None and v != '' and k != 'image_urls'} or {}
+        
+        # Special handling for image_urls - keep even if empty array
+        if 'image_urls' in request.form or (request.get_json() and 'image_urls' in request.get_json()):
+            if request.content_type and request.content_type.startswith('multipart/form-data'):
+                value = request.form.get('image_urls', '[]')
+                try:
+                    car_data['image_urls'] = json.loads(value) if value != 'null' else []
+                except json.JSONDecodeError:
+                    car_data['image_urls'] = []
+            else:
+                car_data['image_urls'] = request.get_json().get('image_urls', [])
         
         update_data = {}
         
-        # Validate and prepare update data
+        # Validate and prepare non-image update data
         if car_data:
-            validation_data = {**existing_car, **car_data}
-            validated_data = validate_car_data(validation_data)
-            update_data.update(validated_data)
+            # Remove image_urls from validation data
+            validation_data = {k: v for k, v in car_data.items() if k != 'image_urls'}
+            if validation_data:
+                validation_data = {**existing_car, **validation_data}
+                validated_data = validate_car_data(validation_data)
+                update_data.update({k: v for k, v in validated_data.items() 
+                                  if k in car_data and k != 'image_urls'})
         
-        # Handle image upload/replacement
-        if uploaded_image and uploaded_image.filename:
+        # IMAGE MANAGEMENT LOGIC
+        # Get existing URLs (handle None case)
+        existing_urls = existing_car.get('image_urls', [])
+        if existing_urls is None:
+            existing_urls = []
+        
+        logger.info(f"Image update for car {car_id}")
+        logger.info(f"  Existing URLs: {existing_urls}")
+        logger.info(f"  Frontend sent image_urls: {'image_urls' in car_data}")
+        logger.info(f"  New files to upload: {len(uploaded_images)}")
+        
+        # Step 1: Upload new images if any
+        new_image_urls = []
+        if uploaded_images:
             try:
-                validate_image_file(uploaded_image)
-                
-                # Delete old image
-                if existing_car.get('image_url'):
-                    delete_image_simple(existing_car['image_url'])
-                
-                # Upload new image
-                image_url = upload_image_simple(uploaded_image, car_id)
-                update_data['image_url'] = image_url
-                
-                logger.info(f"Image updated for car {car_id}")
-                
+                logger.info(f"Uploading {len(uploaded_images)} new images")
+                new_image_urls = upload_multiple_images(uploaded_images, car_id)
+                logger.info(f"Successfully uploaded new images: {new_image_urls}")
             except Exception as e:
                 logger.error(f"Image upload failed: {e}")
                 return jsonify({"error": f"Image upload failed: {str(e)}"}), 400
         
-        # Update car
+        # Step 2: Determine final image URLs based on frontend changes
+        if 'image_urls' in car_data:
+            # Frontend has made changes (deletions/reordering)
+            frontend_urls = car_data['image_urls']
+            if frontend_urls is None:
+                frontend_urls = []
+            
+            logger.info(f"  Frontend URLs (after changes): {frontend_urls}")
+            
+            # Find removed images (in existing but not in frontend)
+            removed_urls = [url for url in existing_urls if url not in frontend_urls]
+            
+            if removed_urls:
+                logger.info(f"  Deleting removed images: {removed_urls}")
+                for removed_url in removed_urls:
+                    try:
+                        delete_image_simple(removed_url)
+                        logger.info(f"    Deleted: {removed_url}")
+                    except Exception as e:
+                        logger.warning(f"    Failed to delete {removed_url}: {e}")
+            
+            # Final URLs = frontend URLs (reordered/filtered) + newly uploaded
+            final_urls = frontend_urls + new_image_urls
+            logger.info(f"  Final URLs (frontend + new): {final_urls}")
+        else:
+            # No frontend changes, just add new images to existing
+            final_urls = existing_urls + new_image_urls
+            logger.info(f"  Final URLs (existing + new): {final_urls}")
+        
+        # Step 3: Update database if images changed
+        if final_urls != existing_urls:
+            update_data['image_urls'] = final_urls
+            logger.info(f"Images changed - updating database with {len(final_urls)} URLs")
+        else:
+            logger.info("No image changes needed")
+        
+        # Step 4: Perform database update if there are changes
         if update_data:
             update_data['updated_at'] = datetime.now().isoformat()
             
-            car_response = get_admin_client().table('cars').update(update_data).eq('id', car_id).execute()
+            logger.info(f"Updating car {car_id} with data: {list(update_data.keys())}")
+            
+            car_response = supabase.table('cars').update(update_data).eq('id', car_id).execute()
             if not car_response.data:
+                logger.error("Database update failed")
                 return jsonify({"error": "Failed to update car"}), 500
             
             updated_car = car_response.data[0]
+            logger.info(f"Car {car_id} updated successfully")
         else:
             updated_car = existing_car
+            logger.info(f"No changes to update for car {car_id}")
         
-        logger.info(f"Car updated by admin {session['admin_username']}: Car ID {car_id}")
+        logger.info(f"Car update completed by admin {session['admin_username']}: Car ID {car_id}")
         
         return jsonify({
             "success": True,
@@ -869,9 +1096,10 @@ def admin_update_car(car_id):
         })
         
     except BadRequest as e:
+        logger.error(f"Bad request for car {car_id}: {e}")
         return jsonify({"error": str(e)}), 400
     except Exception as e:
-        logger.error(f"Error updating car {car_id}: {e}")
+        logger.error(f"Error updating car {car_id}: {e}", exc_info=True)
         return jsonify({"error": "Failed to update car"}), 500
 
 @app.route('/admin/cars/<car_id>', methods=['DELETE'])
@@ -901,9 +1129,10 @@ def admin_delete_car(car_id):
         if bookings_response.data:
             return jsonify({"error": "Cannot delete car with existing bookings"}), 409
         
-        # Delete image if exists
-        if car.get('image_url'):
-            delete_image_simple(car['image_url'])
+        # Delete images if exist
+        if car.get('image_urls'):
+            for image_url in car['image_urls']:
+                delete_image_simple(image_url)
         
         # Delete car record using admin client (service role key)
         car_delete_response = get_admin_client().table('cars').delete().eq('id', car_id).execute()
@@ -1590,6 +1819,154 @@ def health_check():
     health_data['admin_session'] = 'active' if session.get('admin_logged_in') else 'inactive'
     
     return jsonify(health_data), status_code
+
+
+# Добавете този endpoint в app.py
+
+@app.route('/admin/storage-stats', methods=['GET'])
+@admin_required
+def get_storage_stats():
+    """Get detailed storage usage statistics"""
+    try:
+        if not supabase:
+            return jsonify({"error": "Database not available"}), 503
+        
+        storage_stats = {
+            'buckets': {},
+            'total_files': 0,
+            'errors': []
+        }
+        
+        # Get all buckets
+        try:
+            buckets = supabase.storage.list_buckets()
+            
+            for bucket in buckets:
+                bucket_name = bucket['name']
+                
+                try:
+                    # List all files in bucket
+                    files = supabase.storage.from_(bucket_name).list()
+                    
+                    if files:
+                        bucket_files = len(files)
+                        
+                        # Get some file details
+                        sample_files = []
+                        for i, file in enumerate(files[:5]):  # First 5 files as sample
+                            file_info = {
+                                'name': file['name'],
+                                'created_at': file.get('created_at'),
+                                'updated_at': file.get('updated_at'),
+                                'size': file.get('metadata', {}).get('size', 'Unknown')
+                            }
+                            sample_files.append(file_info)
+                        
+                        storage_stats['buckets'][bucket_name] = {
+                            'files_count': bucket_files,
+                            'sample_files': sample_files
+                        }
+                        storage_stats['total_files'] += bucket_files
+                    else:
+                        storage_stats['buckets'][bucket_name] = {
+                            'files_count': 0,
+                            'sample_files': []
+                        }
+                        
+                except Exception as e:
+                    storage_stats['errors'].append(f"Error accessing bucket {bucket_name}: {str(e)}")
+                    storage_stats['buckets'][bucket_name] = {
+                        'files_count': 'Error',
+                        'error': str(e)
+                    }
+            
+        except Exception as e:
+            storage_stats['errors'].append(f"Error listing buckets: {str(e)}")
+        
+        # Estimate storage usage (this is approximate)
+        storage_stats['usage_info'] = {
+            'free_tier_limit': '1 GB',
+            'note': 'Exact size calculation requires individual file size checks'
+        }
+        
+        return jsonify(storage_stats)
+        
+    except Exception as e:
+        logger.error(f"Error getting storage statistics: {e}")
+        return jsonify({"error": "Failed to get storage statistics"}), 500
+
+
+@app.route('/usage-overview', methods=['GET'])
+# @admin_required
+def get_usage_overview():
+    """Get complete usage overview - database + storage"""
+    try:
+        if not supabase:
+            return jsonify({"error": "Database not available"}), 503
+        
+        overview = {
+            'database': {},
+            'storage': {},
+            'limits': {
+                'database_mb': 500,  # Free tier
+                'storage_gb': 1      # Free tier
+            }
+        }
+        
+        # Database usage
+        try:
+            # Get database size
+            db_size_query = """
+            SELECT 
+                pg_size_pretty(pg_database_size(current_database())) as size_pretty,
+                pg_database_size(current_database()) as size_bytes
+            """
+            
+            # Note: Supabase може да не поддържа директни SQL заявки чрез API
+            # В този случай ще използваме приблизителна оценка
+            
+            # Count records instead
+            cars_count = supabase.table('cars').select('id', count='exact').execute()
+            bookings_count = supabase.table('bookings').select('id', count='exact').execute()
+            
+            # Estimate size (very rough)
+            estimated_size_mb = (cars_count.count * 0.1) + (bookings_count.count * 0.05)  # KB per record
+            
+            overview['database'] = {
+                'cars_count': cars_count.count,
+                'bookings_count': bookings_count.count,
+                'estimated_size_mb': round(estimated_size_mb, 2),
+                'usage_percent': round((estimated_size_mb / 500) * 100, 1)
+            }
+            
+        except Exception as e:
+            overview['database'] = {'error': str(e)}
+        
+        # Storage usage
+        try:
+            buckets = supabase.storage.list_buckets()
+            total_files = 0
+            
+            for bucket in buckets:
+                try:
+                    files = supabase.storage.from_(bucket['name']).list()
+                    total_files += len(files) if files else 0
+                except:
+                    pass
+            
+            overview['storage'] = {
+                'total_files': total_files,
+                'estimated_usage_note': 'Check Supabase Dashboard for exact storage usage'
+            }
+            
+        except Exception as e:
+            overview['storage'] = {'error': str(e)}
+        
+        return jsonify(overview)
+        
+    except Exception as e:
+        logger.error(f"Error getting usage overview: {e}")
+        return jsonify({"error": "Failed to get usage overview"}), 500
 
 # Error handlers
 @app.errorhandler(404)
