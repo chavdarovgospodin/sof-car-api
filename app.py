@@ -843,12 +843,12 @@ def admin_create_car():
                         car_data[key] = json.loads(value)
                     except json.JSONDecodeError:
                         car_data[key] = [feature.strip() for feature in value.split(',') if feature.strip()]
-                elif key in ['year', 'price_per_day', 'deposit_amount']:
+                elif key in ['year', 'price_per_day', 'deposit_amount', 'seats', 'large_luggage', 'small_luggage', 'doors', 'min_age']:
                     try:
                         car_data[key] = float(value) if key in ['price_per_day', 'deposit_amount'] else int(value)
                     except (ValueError, TypeError):
                         pass
-                elif key == 'is_active':
+                elif key in ['is_active', 'four_wd', 'ac']:
                     car_data[key] = value.lower() in ['true', '1', 'yes', 'on']
                 else:
                     car_data[key] = value
@@ -965,12 +965,12 @@ def admin_update_car(car_id):
                         car_data[key] = json.loads(value) if value != 'null' else []
                     except json.JSONDecodeError:
                         car_data[key] = []
-                elif key in ['year', 'price_per_day', 'deposit_amount']:
+                elif key in ['year', 'price_per_day', 'deposit_amount', 'seats', 'large_luggage', 'small_luggage', 'doors', 'min_age']:
                     try:
                         car_data[key] = float(value) if key in ['price_per_day', 'deposit_amount'] else int(value)
                     except (ValueError, TypeError):
                         pass
-                elif key == 'is_active':
+                elif key in ['is_active', 'four_wd', 'ac']:
                     car_data[key] = value.lower() in ['true', '1', 'yes', 'on']
                 else:
                     car_data[key] = value
@@ -1821,81 +1821,6 @@ def health_check():
     return jsonify(health_data), status_code
 
 
-# Добавете този endpoint в app.py
-
-@app.route('/admin/storage-stats', methods=['GET'])
-@admin_required
-def get_storage_stats():
-    """Get detailed storage usage statistics"""
-    try:
-        if not supabase:
-            return jsonify({"error": "Database not available"}), 503
-        
-        storage_stats = {
-            'buckets': {},
-            'total_files': 0,
-            'errors': []
-        }
-        
-        # Get all buckets
-        try:
-            buckets = supabase.storage.list_buckets()
-            
-            for bucket in buckets:
-                bucket_name = bucket['name']
-                
-                try:
-                    # List all files in bucket
-                    files = supabase.storage.from_(bucket_name).list()
-                    
-                    if files:
-                        bucket_files = len(files)
-                        
-                        # Get some file details
-                        sample_files = []
-                        for i, file in enumerate(files[:5]):  # First 5 files as sample
-                            file_info = {
-                                'name': file['name'],
-                                'created_at': file.get('created_at'),
-                                'updated_at': file.get('updated_at'),
-                                'size': file.get('metadata', {}).get('size', 'Unknown')
-                            }
-                            sample_files.append(file_info)
-                        
-                        storage_stats['buckets'][bucket_name] = {
-                            'files_count': bucket_files,
-                            'sample_files': sample_files
-                        }
-                        storage_stats['total_files'] += bucket_files
-                    else:
-                        storage_stats['buckets'][bucket_name] = {
-                            'files_count': 0,
-                            'sample_files': []
-                        }
-                        
-                except Exception as e:
-                    storage_stats['errors'].append(f"Error accessing bucket {bucket_name}: {str(e)}")
-                    storage_stats['buckets'][bucket_name] = {
-                        'files_count': 'Error',
-                        'error': str(e)
-                    }
-            
-        except Exception as e:
-            storage_stats['errors'].append(f"Error listing buckets: {str(e)}")
-        
-        # Estimate storage usage (this is approximate)
-        storage_stats['usage_info'] = {
-            'free_tier_limit': '1 GB',
-            'note': 'Exact size calculation requires individual file size checks'
-        }
-        
-        return jsonify(storage_stats)
-        
-    except Exception as e:
-        logger.error(f"Error getting storage statistics: {e}")
-        return jsonify({"error": "Failed to get storage statistics"}), 500
-
-
 @app.route('/usage-overview', methods=['GET'])
 # @admin_required
 def get_usage_overview():
@@ -1942,24 +1867,79 @@ def get_usage_overview():
         except Exception as e:
             overview['database'] = {'error': str(e)}
         
-        # Storage usage
+        # Storage usage - try to get bucket info first
         try:
-            buckets = supabase.storage.list_buckets()
+            logger.info("Checking storage usage...")
             total_files = 0
+            total_size_bytes = 0
+            bucket_details = {}
             
-            for bucket in buckets:
+            # Try to get bucket info first
+            try:
+                logger.info("Attempting to get bucket info...")
+                buckets_info = supabase.storage.list_buckets()
+                logger.info(f"Bucket info response: {buckets_info}")
+                
+                # Check if we can get size info from bucket metadata
+                for bucket_info in buckets_info:
+                    bucket_name = bucket_info.get('name')
+                    if bucket_name:
+                        logger.info(f"Found bucket: {bucket_name}, metadata: {bucket_info}")
+            except Exception as bucket_info_error:
+                logger.warning(f"Could not get bucket info: {bucket_info_error}")
+            
+            # Known buckets to check
+            known_buckets = ['cars']
+            
+            for bucket_name in known_buckets:
                 try:
-                    files = supabase.storage.from_(bucket['name']).list()
-                    total_files += len(files) if files else 0
-                except:
-                    pass
+                    logger.info(f"Checking bucket: {bucket_name}")
+                    files = supabase.storage.from_(bucket_name).list()
+                    bucket_files = len(files) if files else 0
+                    total_files += bucket_files
+                    
+                    # Calculate total size in bytes
+                    bucket_size_bytes = 0
+                    if files:
+                        for file in files:
+                            file_size = file.get('metadata', {}).get('size', 0)
+                            if isinstance(file_size, (int, float)):
+                                bucket_size_bytes += file_size
+                    
+                    total_size_bytes += bucket_size_bytes
+                    
+                    # Convert to MB
+                    bucket_size_mb = round(bucket_size_bytes / (1024 * 1024), 2)
+                    
+                    logger.info(f"Bucket {bucket_name} has {bucket_files} files, total size: {bucket_size_mb} MB")
+                    
+                    bucket_details[bucket_name] = {
+                        'files_count': bucket_files,
+                        'size_bytes': bucket_size_bytes,
+                        'size_mb': bucket_size_mb,
+                        'sample_files': files[:3] if files else []  # First 3 files as sample
+                    }
+                except Exception as e:
+                    logger.error(f"Error accessing bucket {bucket_name}: {e}")
+                    bucket_details[bucket_name] = {
+                        'files_count': 0,
+                        'error': str(e)
+                    }
+            
+            # Calculate total storage size
+            total_size_mb = round(total_size_bytes / (1024 * 1024), 2)
+            total_size_gb = round(total_size_mb / 1024, 3)
             
             overview['storage'] = {
                 'total_files': total_files,
+                'total_size_mb': total_size_mb,
+                'total_size_gb': total_size_gb,
+                'buckets': bucket_details,
                 'estimated_usage_note': 'Check Supabase Dashboard for exact storage usage'
             }
             
         except Exception as e:
+            logger.error(f"Error getting storage info: {e}")
             overview['storage'] = {'error': str(e)}
         
         return jsonify(overview)
