@@ -1055,9 +1055,33 @@ def admin_update_car(car_id):
                     except Exception as e:
                         logger.warning(f"    Failed to delete {removed_url}: {e}")
             
-            # Final URLs = frontend URLs (reordered/filtered) + newly uploaded
-            final_urls = frontend_urls + new_image_urls
-            logger.info(f"  Final URLs (frontend + new): {final_urls}")
+            # Check if frontend wants to reorder images (main_image_index parameter)
+            main_image_index = car_data.get('main_image_index')
+            if main_image_index is not None:
+                try:
+                    main_index = int(main_image_index)
+                    # Create the combined list as frontend sees it
+                    all_urls = frontend_urls + new_image_urls
+                    
+                    if 0 <= main_index < len(all_urls):
+                        # Reorder: move the image at main_index to position 0
+                        main_image = all_urls[main_index]
+                        # Remove from current position and add to beginning
+                        all_urls.pop(main_index)
+                        all_urls.insert(0, main_image)
+                        final_urls = all_urls
+                    else:
+                        # Invalid index, use default order
+                        final_urls = frontend_urls + new_image_urls
+                        logger.warning(f"  Invalid main_image_index {main_index}, using default order")
+                except (ValueError, TypeError) as e:
+                    # Invalid main_image_index, use default order
+                    final_urls = frontend_urls + new_image_urls
+                    logger.warning(f"  Invalid main_image_index format: {e}, using default order")
+            else:
+                # No reordering requested, use default order
+                final_urls = frontend_urls + new_image_urls
+                logger.info(f"  Final URLs (frontend + new): {final_urls}")
         else:
             # No frontend changes, just add new images to existing
             final_urls = existing_urls + new_image_urls
@@ -1070,7 +1094,11 @@ def admin_update_car(car_id):
         else:
             logger.info("No image changes needed")
         
-        # Step 4: Perform database update if there are changes
+        # Step 4: Remove frontend-only parameters before database update
+        if 'main_image_index' in update_data:
+            del update_data['main_image_index']
+        
+        # Step 5: Perform database update if there are changes
         if update_data:
             update_data['updated_at'] = datetime.now().isoformat()
             
