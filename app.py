@@ -1,63 +1,71 @@
+"""
+SofCar Flask API - Main Application
+Refactored modular structure for cPanel deployment
+"""
+
 import os
 import sys
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, g, session, make_response
-from flask_cors import CORS
-import logging
-from supabase import create_client, Client
-from functools import wraps
-import hashlib
 import time
-from typing import Optional, Dict, Any
-import json
+import logging
+from datetime import datetime
+from flask import Flask, request, jsonify, make_response, session
+from flask_cors import CORS
 from werkzeug.exceptions import BadRequest, TooManyRequests, Unauthorized
-from werkzeug.utils import secure_filename
-import ipaddress
-from dotenv import load_dotenv
-import uuid
-import mimetypes
-import base64
-import requests
 
-# Load environment variables
-load_dotenv()
+# Import our modules
+from config import Config
+from database import DatabaseService
+from validators import (
+    validate_booking_data, validate_car_data, validate_contact_form_data,
+    validate_booking_update_data, validate_date_format
+)
+from email_service import EmailService
+from auth import admin_required, admin_login, admin_logout, get_admin_status
+from utils import (
+    get_client_ip, calculate_total_price, check_rate_limit,
+    upload_multiple_images, delete_image_simple, get_usage_statistics
+)
 
 # Initialize Flask app
 app = Flask(__name__)
 
+# Configure Flask app
 app.config.update(
-    SECRET_KEY=os.environ.get('SECRET_KEY'),  # Нов key
-    SESSION_COOKIE_SECURE=True,   # True за HTTPS
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE='None',  # За cross-origin (localhost → sof-car.eu)
-    SESSION_COOKIE_DOMAIN=None,
-    PERMANENT_SESSION_LIFETIME=timedelta(hours=8)
+    SECRET_KEY=Config.SECRET_KEY,
+    SESSION_COOKIE_SECURE=Config.SESSION_COOKIE_SECURE,
+    SESSION_COOKIE_HTTPONLY=Config.SESSION_COOKIE_HTTPONLY,
+    SESSION_COOKIE_SAMESITE=Config.SESSION_COOKIE_SAMESITE,
+    SESSION_COOKIE_DOMAIN=Config.SESSION_COOKIE_DOMAIN,
+    PERMANENT_SESSION_LIFETIME=Config.PERMANENT_SESSION_LIFETIME
 )
 
+# Configure CORS
 CORS(app, 
-     origins=[
-         'https://sof-car.eu', 
-         'https://sof-car-nextjs.vercel.app', 
-         'http://localhost:3000', 
-         'https://localhost:3000',
-         'http://192.168.1.7:3000',
-         'https://192.168.1.7:3000',
-     ], 
-     supports_credentials=True,
-     allow_headers=[
-         'Content-Type', 
-         'Authorization',
-         'X-Requested-With',
-         'Accept',
-         'Origin',
-         'Cache-Control',
-         'X-File-Name',
-         'X-HTTP-Method-Override'
-     ],
-     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD', 'PATCH'],
-     expose_headers=['Content-Range', 'X-Content-Range'],
-     max_age=86400  # Cache preflight for 24 hours
+     origins=Config.CORS_ORIGINS,
+     supports_credentials=Config.CORS_SUPPORTS_CREDENTIALS,
+     allow_headers=Config.CORS_ALLOW_HEADERS,
+     methods=Config.CORS_METHODS,
+     expose_headers=Config.CORS_EXPOSE_HEADERS,
+     max_age=Config.CORS_MAX_AGE
 )
+
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, Config.LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Initialize services
+try:
+    Config.validate_required_config()
+    db_service = DatabaseService(Config.SUPABASE_URL, Config.SUPABASE_ANON_KEY, Config.SUPABASE_SERVICE_ROLE_KEY)
+    email_service = EmailService()
+    logger.info("All services initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize services: {e}")
+    db_service = None
+    email_service = None
 
 # Add explicit OPTIONS handler for all admin routes
 @app.before_request
@@ -72,701 +80,23 @@ def handle_preflight():
         response.headers.add('Access-Control-Max-Age', '86400')
         return response
 
-# Configure logging
-log_level = os.environ.get('LOG_LEVEL', 'INFO')
-logging.basicConfig(
-    level=getattr(logging, log_level),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Initialize Supabase client
-try:
-    supabase_url = os.environ.get('SUPABASE_URL')
-    supabase_key = os.environ.get('SUPABASE_ANON_KEY')
-    supabase_service_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
-    
-    if not supabase_url or not supabase_key:
-        raise ValueError("Missing Supabase environment variables")
-    
-    supabase: Client = create_client(supabase_url, supabase_key)
-    logger.info("Supabase client initialized successfully")
-    
-    # Create service role client for admin operations
-    if supabase_service_key and supabase_service_key != 'your_service_role_key_here':
-        supabase_admin: Client = create_client(supabase_url, supabase_service_key)
-        logger.info("Supabase admin client initialized successfully")
-    else:
-        supabase_admin = None  # Will create admin client on demand
-        logger.warning("Service role key not configured, admin operations will create client on demand")
-        
-except Exception as e:
-    logger.error(f"Failed to initialize Supabase client: {e}")
-    supabase = None
-    supabase_admin = None
-
-# Helper function to create admin client
-def get_admin_client():
-    """Create admin client with service role key to bypass RLS"""
-    try:
-        supabase_url = os.environ.get('SUPABASE_URL')
-        supabase_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
-        
-        # Debug logging
-        logger.info(f"Creating admin client with service role")
-        logger.info(f"URL present: {bool(supabase_url)}")
-        logger.info(f"Service key present: {bool(supabase_key)}")
-        
-        if not supabase_url or not supabase_key:
-            logger.error(f"Missing Supabase credentials - URL: {bool(supabase_url)}, Key: {bool(supabase_key)}")
-            raise Exception("Missing Supabase environment variables")
-        
-        client = create_client(supabase_url, supabase_key)
-        logger.info("Admin client created successfully with service role key")
-        return client
-    except Exception as e:
-        logger.error(f"Failed to create admin client: {e}")
-        raise
-
-# Admin credentials from environment
-ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
-ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'change_this_password')
-
-# EmailJS configuration
-EMAILJS_SERVICE_ID = os.environ.get('EMAILJS_SERVICE_ID')
-EMAILJS_PUBLIC_KEY = os.environ.get('EMAILJS_PUBLIC_KEY')
-EMAILJS_PRIVATE_KEY = os.environ.get('EMAILJS_PRIVATE_KEY')
-EMAILJS_CONTACT_TEMPLATE_ID = os.environ.get('EMAILJS_CONTACT_TEMPLATE_ID')
-EMAILJS_BOOKING_TEMPLATE_ID = os.environ.get('EMAILJS_BOOKING_TEMPLATE_ID')
-
-# File upload settings
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
-SUPABASE_BUCKET = 'cars'
-
-# Simple rate limiting storage (in-memory for development)
-rate_limit_storage = {}
-
-# Security settings
-HONEYPOT_FIELDS = ['website', 'phone_number', 'company', 'subject', 'url', 'homepage']
-ALLOWED_PAYMENT_METHODS = ['cash', 'card', 'bank_transfer', 'online']
-rate_limit_window = 3600  # 1 hour
-rate_limit_max_requests = 5
-
-# Concurrency protection
-booking_locks = {}  # Simple in-memory locks per car_id
-
-def get_client_ip():
-    """Get client IP address"""
-    if request.headers.get('X-Forwarded-For'):
-        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
-    return request.remote_addr or 'unknown'
-
-def allowed_file(filename):
-    """Check if uploaded file is allowed"""
-    if not filename:
-        return False
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def validate_image_file(file):
-    """Validate uploaded image file"""
-    try:
-        logger.debug(f"Validating file: {file.filename}")
-        
-        if not file or not hasattr(file, 'filename') or file.filename == '':
-            raise BadRequest("No file selected")
-        
-        # Check if it's actually a file object
-        if not hasattr(file, 'seek') or not hasattr(file, 'tell') or not hasattr(file, 'read'):
-            logger.error(f"Invalid file object: {type(file)}")
-            raise BadRequest("Invalid file object")
-        
-        # Check file extension
-        if not allowed_file(file.filename):
-            raise BadRequest(f"File type not allowed. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}")
-        
-        # Check file size
-        file.seek(0, os.SEEK_END)
-        file_length = file.tell()
-        file.seek(0)  # Reset file pointer
-        
-        logger.debug(f"File size: {file_length} bytes")
-        if file_length > MAX_FILE_SIZE:
-            raise BadRequest(f"File size too large. Maximum size: {MAX_FILE_SIZE/1024/1024:.1f}MB")
-        
-        if file_length == 0:
-            raise BadRequest("File is empty")
-        
-        logger.debug(f"File validation passed for: {file.filename}")
-        return True
-        
-    except BadRequest:
-        raise
-    except Exception as e:
-        logger.error(f"Error validating file: {e}")
-        raise BadRequest(f"Error validating file: {str(e)}")
-
-
-def upload_image_simple(file, car_id):
-    """Upload single image and return URL - Alternative version"""
-    try:
-        file_ext = file.filename.rsplit('.', 1)[1].lower()
-        timestamp = int(time.time())
-        unique_id = uuid.uuid4().hex[:8]
-        filename = f"car_{car_id}_{timestamp}_{unique_id}.{file_ext}"
-        
-        # Read file content
-        file_content = file.read()
-        file.seek(0)
-        
-        # Use admin client for upload
-        admin_client = get_admin_client()
-        
-        # Simple upload without options
-        response = admin_client.storage.from_(SUPABASE_BUCKET).upload(
-            filename,
-            file_content
-        )
-        
-        # Get public URL
-        public_url = admin_client.storage.from_(SUPABASE_BUCKET).get_public_url(filename)
-        
-        logger.info(f"Successfully uploaded image: {filename} -> {public_url}")
-        return public_url
-        
-    except Exception as e:
-        logger.error(f"Error uploading image: {e}", exc_info=True)
-        raise Exception(f"Failed to upload image: {str(e)}")
-
-def upload_multiple_images(files, car_id):
-    """Upload multiple images and return array of URLs"""
-    try:
-        uploaded_urls = []
-        
-        # Filter out empty files and validate
-        valid_files = []
-        for file in files:
-            # Check if it's actually a file object with required attributes
-            if (file and 
-                hasattr(file, 'filename') and 
-                hasattr(file, 'read') and 
-                hasattr(file, 'seek') and
-                file.filename and 
-                file.filename.strip()):
-                valid_files.append(file)
-                logger.debug(f"Valid file found: {file.filename}")
-            else:
-                logger.debug(f"Skipping invalid file object: {type(file)}")
-        
-        if not valid_files:
-            logger.warning("No valid files provided for upload")
-            return []
-        
-        # Upload each file
-        for file in valid_files:
-            try:
-                logger.info(f"Processing file: {file.filename}")
-                validate_image_file(file)
-                image_url = upload_image_simple(file, car_id)
-                uploaded_urls.append(image_url)
-                logger.info(f"Successfully uploaded: {file.filename}")
-            except Exception as file_error:
-                logger.error(f"Failed to upload {file.filename}: {file_error}")
-                # Clean up any successfully uploaded images before failing
-                for url in uploaded_urls:
-                    try:
-                        delete_image_simple(url)
-                    except:
-                        pass
-                raise Exception(f"Failed to upload {file.filename}: {str(file_error)}")
-        
-        logger.info(f"Successfully uploaded {len(uploaded_urls)} images")
-        return uploaded_urls
-        
-    except Exception as e:
-        logger.error(f"Error in upload_multiple_images: {e}")
-        raise
-
-
-def delete_image_simple(image_url):
-    """Delete image from storage by URL - FIXED VERSION"""
-    try:
-        if not image_url:
-            logger.warning("No image URL provided for deletion")
-            return True
-        
-        # Extract filename from URL
-        # Expected format: https://[project].supabase.co/storage/v1/object/public/cars/filename.ext
-        # OR: https://[project].supabase.co/storage/v1/object/sign/cars/filename.ext?token=...
-        
-        # Parse the URL to get the filename
-        if '/storage/v1/object/' in image_url:
-            # Split by the storage path
-            parts = image_url.split('/storage/v1/object/')
-            if len(parts) > 1:
-                # Get everything after 'public/cars/' or 'sign/cars/'
-                path_part = parts[1]
-                
-                # Remove 'public/' or 'sign/' prefix
-                if path_part.startswith('public/'):
-                    path_part = path_part[7:]  # Remove 'public/'
-                elif path_part.startswith('sign/'):
-                    path_part = path_part[5:]  # Remove 'sign/'
-                
-                # Remove bucket name and get filename
-                if path_part.startswith(f'{SUPABASE_BUCKET}/'):
-                    filename = path_part[len(SUPABASE_BUCKET) + 1:]
-                    
-                    # Remove any query parameters (for signed URLs)
-                    if '?' in filename:
-                        filename = filename.split('?')[0]
-                else:
-                    # Fallback to simple extraction
-                    filename = image_url.split('/')[-1].split('?')[0]
-            else:
-                filename = image_url.split('/')[-1].split('?')[0]
-        else:
-            # Fallback: just get the last part of the URL
-            filename = image_url.split('/')[-1].split('?')[0]
-        
-        if not filename:
-            logger.error(f"Could not extract filename from URL: {image_url}")
-            return False
-        
-        logger.info(f"Attempting to delete file: {filename} from bucket: {SUPABASE_BUCKET}")
-        
-        # Use admin client with service role key for deletion
-        admin_client = get_admin_client()
-        
-        # Delete from storage - note the list format
-        try:
-            result = admin_client.storage.from_(SUPABASE_BUCKET).remove([filename])
-            
-            # Log the result
-            logger.info(f"Delete operation completed for: {filename}")
-            logger.debug(f"Delete result: {result}")
-            
-            # Verify deletion by checking if file still exists
-            try:
-                files = admin_client.storage.from_(SUPABASE_BUCKET).list()
-                file_exists = any(f['name'] == filename for f in (files or []))
-                
-                if not file_exists:
-                    logger.info(f"Confirmed: File {filename} successfully deleted from storage")
-                    return True
-                else:
-                    logger.warning(f"File {filename} still exists after delete attempt")
-                    return False
-                    
-            except Exception as verify_error:
-                logger.warning(f"Could not verify deletion: {verify_error}")
-                # Assume success if we can't verify
-                return True
-                
-        except Exception as delete_error:
-            logger.error(f"Delete operation failed: {delete_error}")
-            return False
-        
-    except Exception as e:
-        logger.error(f"Error in delete_image_simple for URL {image_url}: {e}")
-        # Return True to not block other operations
-        return True
-
-# Admin Authentication Decorator
-def admin_required(f):
-    """Decorator to require admin authentication"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'admin_logged_in' not in session or not session['admin_logged_in']:
-            return jsonify({'error': 'Admin authentication required'}), 401
-        
-        # Check session expiry
-        if 'admin_login_time' in session:
-            login_time = datetime.fromisoformat(session['admin_login_time'])
-            if datetime.now() - login_time > timedelta(hours=8):  # 8 hour session
-                session.clear()
-                return jsonify({'error': 'Session expired'}), 401
-        
-        return f(*args, **kwargs)
-    return decorated_function
-
-def check_rate_limit():
-    """Enhanced rate limiting check"""
-    client_ip = get_client_ip()
-    current_time = time.time()
-    
-    if client_ip not in rate_limit_storage:
-        rate_limit_storage[client_ip] = {'count': 0, 'reset_time': current_time + rate_limit_window}
-    
-    # Reset counter if window expired
-    if current_time > rate_limit_storage[client_ip]['reset_time']:
-        rate_limit_storage[client_ip] = {'count': 0, 'reset_time': current_time + rate_limit_window}
-    
-    # Check if limit exceeded
-    if rate_limit_storage[client_ip]['count'] >= rate_limit_max_requests:
-        logger.warning(f"Rate limit exceeded for IP: {client_ip}")
-        raise TooManyRequests("Rate limit exceeded. Maximum 5 bookings per hour per IP.")
-    
-    # Increment counter
-    rate_limit_storage[client_ip]['count'] += 1
-
-def validate_email(email: str) -> bool:
-    """Validate email format"""
-    import re
-    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    return re.match(pattern, email) is not None
-
-def validate_phone(phone: str) -> bool:
-    """Validate Bulgarian phone format"""
-    import re
-    # Remove all non-digit characters
-    clean_phone = re.sub(r'\D', '', phone)
-    return len(clean_phone) >= 10 and len(clean_phone) <= 15
-
-def validate_date_format(date_str: str) -> bool:
-    """Validate date format YYYY-MM-DD"""
-    try:
-        datetime.strptime(date_str, '%Y-%m-%d')
-        return True
-    except ValueError:
-        return False
-
-def validate_car_data(data):
-    """Validate car data for create/update operations"""
-    required_fields = ['brand', 'model', 'year', 'class', 'price_per_day']
-    
-    for field in required_fields:
-        if field not in data or not data[field]:
-            raise BadRequest(f"Missing required field: {field}")
-    
-    # Validate year
-    try:
-        year = int(data['year'])
-        current_year = datetime.now().year
-        if year < 1900 or year > current_year + 2:
-            raise BadRequest("Invalid year")
-    except (ValueError, TypeError):
-        raise BadRequest("Year must be a valid number")
-    
-    # Validate price
-    try:
-        price = float(data['price_per_day'])
-        if price <= 0:
-            raise BadRequest("Price must be positive")
-    except (ValueError, TypeError):
-        raise BadRequest("Price must be a valid number")
-    
-    # Validate deposit amount if provided
-    if 'deposit_amount' in data and data['deposit_amount'] is not None:
-        try:
-            deposit = float(data['deposit_amount'])
-            if deposit < 0:
-                raise BadRequest("Deposit amount cannot be negative")
-        except (ValueError, TypeError):
-            raise BadRequest("Deposit amount must be a valid number")
-    
-    # Validate features if provided
-    if 'features' in data and data['features'] is not None:
-        if isinstance(data['features'], str):
-            try:
-                data['features'] = json.loads(data['features'])
-            except json.JSONDecodeError:
-                raise BadRequest("Features must be valid JSON array")
-        
-        if not isinstance(data['features'], list):
-            raise BadRequest("Features must be an array")
-        
-            # Validate fuel type if provided
-    if 'fuel_type' in data and data['fuel_type']:
-        allowed_fuel_types = ['petrol', 'diesel', 'hybrid', 'electric', 'lpg']
-        if data['fuel_type'] not in allowed_fuel_types:
-            raise BadRequest(f"Invalid fuel type. Allowed: {', '.join(allowed_fuel_types)}")
-
-            # Validate transmission if provided
-    if 'transmission' in data and data['transmission']:
-        allowed_transmissions = ['manual', 'automatic', 'cvt', 'semi-automatic']
-        if data['transmission'] not in allowed_transmissions:
-            raise BadRequest(f"Invalid transmission. Allowed: {', '.join(allowed_transmissions)}")
-
-            # Validate car class if provided
-    allowed_classes = ['economy', 'standard', 'premium']
-    if data['class'] not in allowed_classes:
-        raise BadRequest(f"Invalid car class. Allowed: {', '.join(allowed_classes)}")
-    
-
-    return data
-
-def validate_booking_data(data):
-    """Enhanced validation for booking data"""
-    required_fields = ['car_id', 'start_date', 'end_date', 'client_last_name', 'client_first_name', 'client_email', 'client_phone']
-    
-    for field in required_fields:
-        if field not in data or not data[field]:
-            raise BadRequest(f"Missing required field: {field}")
-    
-    # Honeypot check - reject if any honeypot field is filled
-    for honeypot in HONEYPOT_FIELDS:
-        if honeypot in data and data[honeypot]:
-            logger.warning(f"Honeypot field '{honeypot}' was filled from IP: {get_client_ip()}")
-            raise BadRequest("Invalid form submission")
-    
-    # Validate dates
-    try:
-        start_date = datetime.strptime(data['start_date'], '%Y-%m-%d').date()
-        end_date = datetime.strptime(data['end_date'], '%Y-%m-%d').date()
-        today = datetime.now().date()
-        
-        if start_date >= end_date:
-            raise BadRequest("Start date must be before end date")
-        
-        if start_date <= today:
-            raise BadRequest("Start date must be from tomorrow onwards")
-        
-        # Minimum rental period (5 days)
-        if (end_date - start_date).days < 5:
-            raise BadRequest("Minimum rental period is 5 days")
-        
-        # Maximum rental period (30 days)
-        if (end_date - start_date).days > 30:
-            raise BadRequest("Maximum rental period is 30 days")
-        
-        # Cannot book too far in advance (3 months)
-        if (start_date - today).days > 90:
-            raise BadRequest("Cannot book more than 3 months in advance")
-            
-    except ValueError:
-        raise BadRequest("Invalid date format. Use YYYY-MM-DD")
-    
-    # Validate client last name (minimum 2 characters, letters, spaces and common characters)
-    import re
-    if not re.match(r'^[a-zA-Zа-яА-Я\s\-\.]{2,50}$', data['client_last_name'].strip()):
-        raise BadRequest("Invalid client last name format")
-    
-    # Validate client first name (minimum 2 characters, letters, spaces and common characters)
-    if not re.match(r'^[a-zA-Zа-яА-Я\s\-\.]{2,50}$', data['client_first_name'].strip()):
-        raise BadRequest("Invalid client first name format")
-    
-    # Validate email
-    if not validate_email(data['client_email'].strip()):
-        raise BadRequest("Invalid email format")
-    
-    # Validate phone
-    if not validate_phone(data['client_phone'].strip()):
-        raise BadRequest("Invalid phone number format")
-    
-    # Validate car_id is valid UUID
-    try:
-        uuid.UUID(data['car_id'])
-    except ValueError:
-        raise BadRequest("Invalid car ID format")
-    
-    # Validate payment method
-    payment_method = data.get('payment_method', 'cash')
-    if payment_method not in ALLOWED_PAYMENT_METHODS:
-        raise BadRequest(f"Invalid payment method. Allowed: {', '.join(ALLOWED_PAYMENT_METHODS)}")
-    
-    return data
-
-def calculate_total_price(car_price, start_date, end_date):
-    """Calculate total price for booking"""
-    start = datetime.strptime(start_date, '%Y-%m-%d').date()
-    end = datetime.strptime(end_date, '%Y-%m-%d').date()
-    days = (end - start).days
-    total_price = car_price * days
-    
-    return total_price
-
-# EmailJS Functions
-def send_emailjs_email(service_id, template_id, template_params, public_key, private_key=None):
-    """Send email using EmailJS API"""
-    try:
-        url = "https://api.emailjs.com/api/v1.0/email/send"
-        
-        data = {
-            "service_id": service_id,
-            "template_id": template_id,
-            "user_id": public_key,
-            "template_params": template_params
-        }
-        
-        # Add access token for server-side API calls if available
-        if private_key:
-            data["accessToken"] = private_key
-        
-        response = requests.post(url, json=data, timeout=30)
-        
-        if response.status_code == 200:
-            logger.info(f"Email sent successfully via EmailJS")
-            return True
-        else:
-            logger.error(f"EmailJS API error: {response.status_code} - {response.text}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"Error sending email via EmailJS: {e}")
-        return False
-
-def send_booking_confirmation_email(booking_data, car_data):
-    """Send booking confirmation email to client"""
-    if not all([EMAILJS_SERVICE_ID, EMAILJS_BOOKING_TEMPLATE_ID, EMAILJS_PUBLIC_KEY]):
-        logger.warning("EmailJS not configured for booking confirmations")
-        return False
-    
-    # Calculate rental days
-    start_date = datetime.strptime(booking_data['start_date'], '%Y-%m-%d').date()
-    end_date = datetime.strptime(booking_data['end_date'], '%Y-%m-%d').date()
-    rental_days = (end_date - start_date).days
-    
-    # Calculate BGN values (assuming prices are stored in BGN)
-    total_price_bgn = booking_data['total_price']
-    deposit_amount_bgn = booking_data['deposit_amount']
-    
-    # Calculate EUR equivalents (approximate conversion rate 1.96)
-    total_price_eur = round(total_price_bgn / 1.96, 2)
-    deposit_amount_eur = round(deposit_amount_bgn / 1.96, 2)
-    
-    template_params = {
-        "name": f"{booking_data['client_first_name']} {booking_data['client_last_name']}",
-        "email": booking_data['client_email'],
-        "phone": booking_data['client_phone'],
-        "client_name": f"{booking_data['client_first_name']} {booking_data['client_last_name']}",
-        "client_email": booking_data['client_email'],
-        "booking_reference": f"SOF{booking_data['id'][:8].upper()}",  # Use booking ID as reference
-        "car_brand": car_data['brand'],
-        "car_model": car_data['model'],
-        "car_year": car_data['year'],
-        "start_date": booking_data['start_date'],
-        "end_date": booking_data['end_date'],
-        "rental_days": rental_days,
-        "total_price": f"{total_price_bgn:.2f} лв / ≈{total_price_eur:.2f} €",
-        "deposit_amount": f"{deposit_amount_bgn:.2f} лв / ≈{deposit_amount_eur:.2f} €",
-        "payment_method": booking_data['payment_method']
-    }
-    
-    return send_emailjs_email(
-        EMAILJS_SERVICE_ID,
-        EMAILJS_BOOKING_TEMPLATE_ID,
-        template_params,
-        EMAILJS_PUBLIC_KEY,
-        EMAILJS_PRIVATE_KEY
-    )
-
-def send_admin_notification_email(booking_data, car_data):
-    """Send admin notification email for new booking using contact template"""
-    if not all([EMAILJS_SERVICE_ID, EMAILJS_CONTACT_TEMPLATE_ID, EMAILJS_PUBLIC_KEY]):
-        logger.warning("EmailJS not configured for admin notifications")
-        return False
-    
-    # Calculate rental days
-    start_date = datetime.strptime(booking_data['start_date'], '%Y-%m-%d').date()
-    end_date = datetime.strptime(booking_data['end_date'], '%Y-%m-%d').date()
-    rental_days = (end_date - start_date).days
-    
-    # Format the message for admin notification
-    admin_message = f"""🚗 НОВА РЕЗЕРВАЦИЯ!
-
-Резервация #: SOF{booking_data['id'][:8].upper()}
-ID: {booking_data['id']}
-
-Автомобил: {car_data['brand']} {car_data['model']} ({car_data['year']})
-Период: {booking_data['start_date']} - {booking_data['end_date']}
-Дни: {rental_days}
-Обща сума: {booking_data['total_price']} лв
-Депозит: {booking_data['deposit_amount']} лв
-Метод на плащане: {booking_data['payment_method']}
-
-Моля, свържете се с клиента за потвърждение."""
-    
-    template_params = {
-        "name": f"Booking System - {booking_data['client_first_name']} {booking_data['client_last_name']}",
-        "email": booking_data['client_email'],
-        "phone": booking_data['client_phone'],
-        "message": admin_message
-    }
-    
-    return send_emailjs_email(
-        EMAILJS_SERVICE_ID,
-        EMAILJS_CONTACT_TEMPLATE_ID,  # Използваме contact template
-        template_params,
-        EMAILJS_PUBLIC_KEY,
-        EMAILJS_PRIVATE_KEY
-    )
-
-def send_contact_form_email(form_data):
-    """Send contact form email"""
-    if not all([EMAILJS_SERVICE_ID, EMAILJS_CONTACT_TEMPLATE_ID, EMAILJS_PUBLIC_KEY]):
-        logger.warning("EmailJS not configured for contact form")
-        return False
-    
-    template_params = {
-        "from_name": form_data['name'],
-        "from_email": form_data['email'],
-        "from_phone": form_data.get('phone', ''),
-        "message": form_data['message'],
-        "to_name": "SofCar Team"
-    }
-    
-    return send_emailjs_email(
-        EMAILJS_SERVICE_ID,
-        EMAILJS_CONTACT_TEMPLATE_ID,
-        template_params,
-        EMAILJS_PUBLIC_KEY,
-        EMAILJS_PRIVATE_KEY
-    )
-
-def check_car_availability_atomic(car_id, start_date, end_date):
-    """Atomic availability check with better logic"""
-    try:
-        logger.info(f"Checking availability for car {car_id} from {start_date} to {end_date}")
-        
-        # Check for overlapping confirmed bookings
-        # Use proper Supabase syntax - check for overlapping date ranges
-        # Two separate queries to check for overlaps
-        query1 = supabase.table("bookings").select("id").eq("car_id", car_id).in_("status", ["confirmed", "pending"]).lte("start_date", end_date).gt("end_date", start_date).execute()
-        
-        logger.info(f"Overlap query result: {query1.data}")
-        
-        if query1.data:
-            logger.info(f"Car {car_id} is not available - has overlapping bookings")
-            return False, f"Car is booked for overlapping dates"
-        
-        logger.info(f"Car {car_id} is available for the requested dates")
-        return True, None
-    except Exception as e:
-        logger.error(f"Error checking availability: {e}")
-        return False, "Error checking availability"
-
 # ADMIN API ENDPOINTS
 
 @app.route('/admin/login', methods=['POST'])
-def admin_login():
+def admin_login_endpoint():
     """Admin login endpoint"""
     try:
         data = request.get_json()
         if not data or 'username' not in data or 'password' not in data:
             return jsonify({'error': 'Username and password required'}), 400
         
-        username = data['username']
-        password = data['password']
+        result = admin_login(data['username'], data['password'])
         
-        # Simple credential check
-        if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-            session['admin_logged_in'] = True
-            session['admin_username'] = username
-            session['admin_login_time'] = datetime.now().isoformat()
-            session.permanent = True
-            
-            logger.info(f"Admin login successful for {username} from IP: {get_client_ip()}")
-            
-            return jsonify({
-                'success': True,
-                'message': 'Login successful',
-                'admin': username,
-                'session_expires': (datetime.now() + timedelta(hours=8)).isoformat()
-            })
-        else:
-            logger.warning(f"Failed admin login attempt for username '{username}' from IP: {get_client_ip()}")
-            return jsonify({'error': 'Invalid credentials'}), 401
+        if 'error' in result:
+            return jsonify(result), 401
+        
+        logger.info(f"Admin login successful for {data['username']} from IP: {get_client_ip()}")
+        return jsonify(result)
     
     except Exception as e:
         logger.error(f"Error in admin login: {e}")
@@ -774,48 +104,34 @@ def admin_login():
 
 @app.route('/admin/logout', methods=['POST'])
 @admin_required
-def admin_logout():
+def admin_logout_endpoint():
     """Admin logout endpoint"""
-    session.clear()
-    return jsonify({'success': True, 'message': 'Logged out successfully'})
+    return jsonify(admin_logout())
 
 @app.route('/admin/status', methods=['GET'])
 @admin_required
-def admin_status():
+def admin_status_endpoint():
     """Get admin session status"""
-    return jsonify({
-        'logged_in': True,
-        'admin': session.get('admin_username'),
-        'login_time': session.get('admin_login_time'),
-        'session_expires': (datetime.fromisoformat(session.get('admin_login_time', datetime.now().isoformat())) + timedelta(hours=8)).isoformat()
-    })
-
+    return jsonify(get_admin_status())
 
 @app.route('/admin/cars', methods=['GET'])
 @admin_required
 def admin_get_cars():
     """Get all cars for admin (including inactive)"""
     try:
-        logger.info(f"Admin {session.get('admin_username')} requesting cars list")
+        logger.info(f"Admin requesting cars list")
         
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
-        response = get_admin_client().table('cars').select('*').order('created_at', desc=True).execute()
-        cars = response.data
+        cars = db_service.get_admin_client().table('cars').select('*').order('created_at', desc=True).execute().data
+        stats = db_service.get_car_statistics()
         
-        total_cars = len(cars)
-        active_cars = len([car for car in cars if car.get('is_active', True)])
-        
-        logger.info(f"Retrieved {total_cars} cars for admin (active: {active_cars}, inactive: {total_cars - active_cars})")
+        logger.info(f"Retrieved {len(cars)} cars for admin (active: {stats['active']}, inactive: {stats['inactive']})")
         
         return jsonify({
             "cars": cars,
-            "statistics": {
-                "total": total_cars,
-                "active": active_cars,
-                "inactive": total_cars - active_cars
-            }
+            "statistics": stats
         })
     except Exception as e:
         logger.error(f"Error getting cars for admin: {e}")
@@ -826,9 +142,9 @@ def admin_get_cars():
 def admin_create_car():
     """Create new car with optional single image upload"""
     try:
-        logger.info(f"Admin {session.get('admin_username')} creating new car")
+        logger.info(f"Admin creating new car")
         
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
         # Handle multipart/form-data for file upload
@@ -840,6 +156,7 @@ def admin_create_car():
                 value = request.form[key]
                 if key == 'features' and value:
                     try:
+                        import json
                         car_data[key] = json.loads(value)
                     except json.JSONDecodeError:
                         car_data[key] = [feature.strip() for feature in value.split(',') if feature.strip()]
@@ -867,48 +184,35 @@ def admin_create_car():
         # Set defaults
         validated_data['is_active'] = validated_data.get('is_active', True)
         validated_data['deposit_amount'] = validated_data.get('deposit_amount', 500.00)
-        validated_data['created_at'] = datetime.now().isoformat()
-        validated_data['updated_at'] = datetime.now().isoformat()
         
         # Handle image upload if provided
         if uploaded_images and any(img.filename for img in uploaded_images):
             try:
                 # Create car first
-                car_response = get_admin_client().table('cars').insert(validated_data).execute()
-                if not car_response.data:
-                    return jsonify({"error": "Failed to create car"}), 500
-                
-                car = car_response.data[0]
+                car = db_service.create_car(validated_data)
                 car_id = car['id']
                 
                 # Upload multiple images and update car
                 image_urls = upload_multiple_images(uploaded_images, car_id)
                 
-                update_response = get_admin_client().table('cars').update({
-                    'image_urls': image_urls,
-                    'updated_at': datetime.now().isoformat()
-                }).eq('id', car_id).execute()
-                
-                if update_response.data:
-                    car = update_response.data[0]
+                # Update car with image URLs
+                updated_car = db_service.update_car(car_id, {'image_urls': image_urls})
                 
                 logger.info(f"Car created with {len(image_urls)} images: {car['brand']} {car['model']} (ID: {car_id})")
+                car = updated_car
                 
             except Exception as e:
                 logger.error(f"Image upload failed: {e}")
                 # Delete the created car since image upload failed
                 try:
-                    get_admin_client().table('cars').delete().eq('id', car_id).execute()
+                    db_service.delete_car(car_id)
                     logger.info(f"Deleted car {car_id} due to image upload failure")
                 except Exception as delete_error:
                     logger.error(f"Failed to delete car {car_id} after image upload failure: {delete_error}")
                 return jsonify({"error": f"Image upload failed: {str(e)}"}), 400
         else:
             # Create car without images
-            car_response = get_admin_client().table('cars').insert(validated_data).execute()
-            if not car_response.data:
-                return jsonify({"error": "Failed to create car"}), 500
-            car = car_response.data[0]
+            car = db_service.create_car(validated_data)
             car_id = car['id']
             logger.info(f"Car created without images: {car['brand']} {car['model']} (ID: {car_id})")
         
@@ -929,23 +233,24 @@ def admin_create_car():
 def admin_update_car(car_id):
     """Update existing car with optional image upload/replacement"""
     try:
-        logger.info(f"Admin {session.get('admin_username')} updating car {car_id}")
+        logger.info(f"Admin updating car {car_id}")
         
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
         # Validate car_id format
         try:
+            import uuid
             uuid.UUID(car_id)
         except ValueError:
             return jsonify({"error": "Invalid car ID format"}), 400
         
         # Check if car exists
-        existing_car_response = supabase.table('cars').select('*').eq('id', car_id).execute()
-        if not existing_car_response.data:
+        existing_car = db_service.get_admin_client().table('cars').select('*').eq('id', car_id).execute().data
+        if not existing_car:
             return jsonify({"error": "Car not found"}), 404
         
-        existing_car = existing_car_response.data[0]
+        existing_car = existing_car[0]
         
         # Parse request data based on content type
         if request.content_type and request.content_type.startswith('multipart/form-data'):
@@ -956,6 +261,7 @@ def admin_update_car(car_id):
                 value = request.form[key]
                 if key == 'features' and value:
                     try:
+                        import json
                         car_data[key] = json.loads(value)
                     except json.JSONDecodeError:
                         car_data[key] = [feature.strip() for feature in value.split(',') if feature.strip()]
@@ -1100,22 +406,13 @@ def admin_update_car(car_id):
         
         # Step 5: Perform database update if there are changes
         if update_data:
-            update_data['updated_at'] = datetime.now().isoformat()
-            
-            logger.info(f"Updating car {car_id} with data: {list(update_data.keys())}")
-            
-            car_response = supabase.table('cars').update(update_data).eq('id', car_id).execute()
-            if not car_response.data:
-                logger.error("Database update failed")
-                return jsonify({"error": "Failed to update car"}), 500
-            
-            updated_car = car_response.data[0]
+            updated_car = db_service.update_car(car_id, update_data)
             logger.info(f"Car {car_id} updated successfully")
         else:
             updated_car = existing_car
             logger.info(f"No changes to update for car {car_id}")
         
-        logger.info(f"Car update completed by admin {session['admin_username']}: Car ID {car_id}")
+        logger.info(f"Car update completed by admin: Car ID {car_id}")
         
         return jsonify({
             "success": True,
@@ -1133,28 +430,29 @@ def admin_update_car(car_id):
 @app.route('/admin/cars/<car_id>', methods=['DELETE'])
 @admin_required
 def admin_delete_car(car_id):
-    """Delete car and its image"""
+    """Delete car and its images"""
     try:
-        logger.info(f"Admin {session.get('admin_username')} attempting to delete car {car_id}")
+        logger.info(f"Admin attempting to delete car {car_id}")
         
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
         try:
+            import uuid
             uuid.UUID(car_id)
         except ValueError:
             return jsonify({"error": "Invalid car ID format"}), 400
         
         # Check if car exists using admin client
-        existing_car_response = get_admin_client().table('cars').select('*').eq('id', car_id).execute()
-        if not existing_car_response.data:
+        existing_car = db_service.get_admin_client().table('cars').select('*').eq('id', car_id).execute().data
+        if not existing_car:
             return jsonify({"error": "Car not found"}), 404
         
-        car = existing_car_response.data[0]
+        car = existing_car[0]
         
         # Check for existing bookings using admin client
-        bookings_response = get_admin_client().table('bookings').select('id').eq('car_id', car_id).in_('status', ['confirmed', 'pending']).execute()
-        if bookings_response.data:
+        bookings = db_service.get_admin_client().table('bookings').select('id').eq('car_id', car_id).in_('status', ['confirmed', 'pending']).execute().data
+        if bookings:
             return jsonify({"error": "Cannot delete car with existing bookings"}), 409
         
         # Delete images if exist
@@ -1163,16 +461,9 @@ def admin_delete_car(car_id):
                 delete_image_simple(image_url)
         
         # Delete car record using admin client (service role key)
-        car_delete_response = get_admin_client().table('cars').delete().eq('id', car_id).execute()
+        db_service.delete_car(car_id)
         
-        # Verify deletion by checking if car still exists
-        verify_response = get_admin_client().table('cars').select('id').eq('id', car_id).execute()
-        
-        if verify_response.data:
-            logger.error(f"Car {car_id} still exists after delete operation")
-            return jsonify({"error": "Failed to delete car - car still exists"}), 500
-        
-        logger.info(f"Car deleted by admin {session['admin_username']}: {car['brand']} {car['model']} (ID: {car_id})")
+        logger.info(f"Car deleted by admin: {car['brand']} {car['model']} (ID: {car_id})")
         
         return jsonify({
             "success": True,
@@ -1189,104 +480,39 @@ def admin_delete_car(car_id):
 def admin_update_booking(booking_id):
     """Update booking - only status, deposit_status, and notes allowed"""
     try:
-        logger.info(f"Admin {session.get('admin_username')} updating booking {booking_id}")
+        logger.info(f"Admin updating booking {booking_id}")
         
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
         try:
+            import uuid
             uuid.UUID(booking_id)
         except ValueError:
             return jsonify({"error": "Invalid booking ID format"}), 400
         
         # Check if booking exists using admin client
-        existing_booking_response = get_admin_client().table('bookings').select('*').eq('id', booking_id).execute()
-        if not existing_booking_response.data:
+        existing_booking = db_service.get_admin_client().table('bookings').select('*').eq('id', booking_id).execute().data
+        if not existing_booking:
             return jsonify({"error": "Booking not found"}), 404
         
-        existing_booking = existing_booking_response.data[0]
+        existing_booking = existing_booking[0]
         
         # Get update data
         data = request.get_json()
         if not data:
             return jsonify({"error": "No data provided"}), 400
         
-        # Only allow specific fields to be updated
-        allowed_fields = ['status', 'deposit_status', 'notes']
-        update_data = {}
-        
-        for field in allowed_fields:
-            if field in data:
-                update_data[field] = data[field]
-        
-        if not update_data:
-            return jsonify({"error": "No valid fields to update"}), 400
-        
-        # Validate status values
-        if 'status' in update_data:
-            valid_statuses = ['pending', 'confirmed', 'cancelled', 'completed']
-            if update_data['status'] not in valid_statuses:
-                return jsonify({"error": f"Invalid status. Allowed: {', '.join(valid_statuses)}"}), 400
-        
-        # Validate deposit_status values
-        if 'deposit_status' in update_data:
-            valid_deposit_statuses = ['pending', 'paid', 'refunded']
-            if update_data['deposit_status'] not in valid_deposit_statuses:
-                return jsonify({"error": f"Invalid deposit_status. Allowed: {', '.join(valid_deposit_statuses)}"}), 400
-        
-        # Add updated timestamp
-        update_data['updated_at'] = datetime.now().isoformat()
+        # Validate update data
+        update_data = validate_booking_update_data(data)
         
         logger.info(f"Updating booking {booking_id} with data: {update_data}")
         
         # Use admin client for update operations (bypasses RLS)
-        admin_client = get_admin_client()
-        
-        try:
-            # Try update with admin client
-            update_response = admin_client.table('bookings').update(update_data).eq('id', booking_id).execute()
-            logger.info(f"Update response: {update_response}")
-            
-            # Fetch the updated record
-            booking_response = admin_client.table('bookings').select('*').eq('id', booking_id).execute()
-            logger.info(f"Fetch response: {booking_response}")
-            
-        except Exception as e:
-            logger.error(f"Update failed: {e}")
-            error_msg = str(e)
-            if "row-level security policy" in error_msg:
-                return jsonify({
-                    "error": "Update failed due to database permissions. Please check RLS policies or use service role key.",
-                    "details": error_msg
-                }), 500
-            return jsonify({"error": f"Update failed: {error_msg}"}), 500
-        
-        logger.info(f"Supabase update response: {booking_response}")
-        
-        # Check if update was successful
-        if not booking_response.data:
-            logger.error(f"Supabase update failed - no data returned: {booking_response}")
-            return jsonify({"error": "Failed to update booking", "details": str(booking_response)}), 500
-        
-        updated_booking = booking_response.data[0]
-        
-        # Verify the update actually happened by checking the values
-        update_failed = False
-        for field, value in update_data.items():
-            if field != 'updated_at' and updated_booking.get(field) != value:
-                logger.warning(f"Field {field} was not updated properly. Expected: {value}, Got: {updated_booking.get(field)}")
-                update_failed = True
-        
-        if update_failed:
-            logger.error(f"Update verification failed for booking {booking_id}")
-            return jsonify({
-                "error": "Update failed - data was not actually updated in database. This may be due to RLS policies.",
-                "details": "Please check database permissions or use service role key for admin operations."
-            }), 500
+        updated_booking = db_service.update_booking(booking_id, update_data)
         
         logger.info(f"Successfully updated booking {booking_id}. New values: {updated_booking}")
-        
-        logger.info(f"Booking updated by admin {session['admin_username']}: Booking ID {booking_id}, Changes: {list(update_data.keys())}")
+        logger.info(f"Booking updated by admin: Booking ID {booking_id}, Changes: {list(update_data.keys())}")
         
         return jsonify({
             "success": True,
@@ -1295,6 +521,9 @@ def admin_update_booking(booking_id):
             "updated_fields": list(update_data.keys())
         })
         
+    except BadRequest as e:
+        logger.error(f"Bad request for booking {booking_id}: {e}")
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         logger.error(f"Error updating booking {booking_id}: {e}")
         return jsonify({"error": "Failed to update booking"}), 500
@@ -1304,7 +533,7 @@ def admin_update_booking(booking_id):
 def admin_delete_booking(booking_id):
     """Soft delete a booking by setting status to 'deleted'"""
     try:
-        logger.info(f"Admin {session.get('admin_username')} attempting to soft delete booking {booking_id}")
+        logger.info(f"Admin attempting to soft delete booking {booking_id}")
         
         # Get request data
         data = request.get_json()
@@ -1312,43 +541,23 @@ def admin_delete_booking(booking_id):
             return jsonify({"error": "Invalid request. Expected status: 'deleted'"}), 400
         
         # Check if booking exists using admin client
-        existing_booking_response = get_admin_client().table('bookings').select('*').eq('id', booking_id).execute()
-        if not existing_booking_response.data:
+        existing_booking = db_service.get_admin_client().table('bookings').select('*').eq('id', booking_id).execute().data
+        if not existing_booking:
             logger.warning(f"Booking {booking_id} not found")
             return jsonify({"error": "Booking not found"}), 404
         
-        existing_booking = existing_booking_response.data[0]
+        existing_booking = existing_booking[0]
         
         # Check if already deleted
         if existing_booking.get('status') == 'deleted':
             logger.warning(f"Booking {booking_id} is already deleted")
             return jsonify({"error": "Booking is already deleted"}), 400
         
-        # Use admin client for update (bypasses RLS)
-        admin_client = get_admin_client()
-        
         # Soft delete by setting status to 'deleted'
-        update_data = {
-            'status': 'deleted',
-            'updated_at': datetime.now().isoformat()
-        }
-        
-        update_response = admin_client.table('bookings').update(update_data).eq('id', booking_id).execute()
-        
-        if not update_response.data:
-            logger.error(f"Failed to delete booking {booking_id} - no data returned")
-            return jsonify({"error": "Failed to delete booking"}), 500
-        
-        # Verify the update
-        booking_response = admin_client.table('bookings').select('*').eq('id', booking_id).execute()
-        if not booking_response.data or booking_response.data[0].get('status') != 'deleted':
-            logger.error(f"Delete verification failed for booking {booking_id}")
-            return jsonify({"error": "Delete failed - booking status was not updated to deleted"}), 500
-        
-        deleted_booking = booking_response.data[0]
+        deleted_booking = db_service.soft_delete_booking(booking_id)
         
         logger.info(f"Successfully soft deleted booking {booking_id}")
-        logger.info(f"Booking soft deleted by admin {session['admin_username']}: Booking ID {booking_id}")
+        logger.info(f"Booking soft deleted by admin: Booking ID {booking_id}")
         
         return jsonify({
             "success": True,
@@ -1365,70 +574,30 @@ def admin_delete_booking(booking_id):
 def admin_get_bookings():
     """Get all bookings for admin with filtering options"""
     try:
-        logger.info(f"Admin {session.get('admin_username')} requesting bookings list")
+        logger.info(f"Admin requesting bookings list")
         
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
         # Get query parameters
-        status = request.args.get('status')
-        car_id = request.args.get('car_id')
-        start_date = request.args.get('start_date')
-        end_date = request.args.get('end_date')
-        limit = request.args.get('limit', 100)
-        offset = request.args.get('offset', 0)
+        filters = {
+            'status': request.args.get('status'),
+            'car_id': request.args.get('car_id'),
+            'start_date': request.args.get('start_date'),
+            'end_date': request.args.get('end_date')
+        }
         
-        # Build query using admin client
-        query = get_admin_client().table('bookings').select('*, cars(brand, model, year, class)')
+        # Remove None values
+        filters = {k: v for k, v in filters.items() if v is not None}
         
-        # Apply filters
-        if status:
-            query = query.eq('status', status)
+        limit = min(int(request.args.get('limit', 100)), 500)  # Max 500 records
+        offset = max(int(request.args.get('offset', 0)), 0)
         
-        if car_id:
-            try:
-                query = query.eq('car_id', car_id)
-            except ValueError:
-                return jsonify({"error": "Invalid car_id"}), 400
+        # Get bookings with filters
+        bookings = db_service.get_bookings_filtered(filters, limit, offset)
         
-        if start_date:
-            if not validate_date_format(start_date):
-                return jsonify({"error": "Invalid start_date format"}), 400
-            query = query.gte('start_date', start_date)
-        
-        if end_date:
-            if not validate_date_format(end_date):
-                return jsonify({"error": "Invalid end_date format"}), 400
-            query = query.lte('end_date', end_date)
-        
-        # Apply pagination and ordering
-        try:
-            limit = min(int(limit), 500)  # Max 500 records
-            offset = max(int(offset), 0)
-        except ValueError:
-            return jsonify({"error": "Invalid limit or offset"}), 400
-        
-        query = query.order('created_at', desc=True).limit(limit).offset(offset)
-        
-        # Execute query
-        response = query.execute()
-        bookings = response.data
-        
-        # Get summary statistics using admin client
-        stats_query = get_admin_client().table('bookings').select('status, total_price')
-        if start_date:
-            stats_query = stats_query.gte('start_date', start_date)
-        if end_date:
-            stats_query = stats_query.lte('end_date', end_date)
-        
-        stats_response = stats_query.execute()
-        
-        # Calculate statistics
-        total_bookings = len(stats_response.data)
-        pending_bookings = len([b for b in stats_response.data if b['status'] == 'pending'])
-        confirmed_bookings = len([b for b in stats_response.data if b['status'] == 'confirmed'])
-        cancelled_bookings = len([b for b in stats_response.data if b['status'] == 'cancelled'])
-        total_revenue = sum([float(b['total_price'] or 0) for b in stats_response.data if b['status'] == 'confirmed'])
+        # Get statistics
+        stats = db_service.get_booking_statistics(filters)
         
         return jsonify({
             "bookings": bookings,
@@ -1437,26 +606,15 @@ def admin_get_bookings():
                 "offset": offset,
                 "returned": len(bookings)
             },
-            "filters": {
-                "status": status,
-                "car_id": car_id,
-                "start_date": start_date,
-                "end_date": end_date
-            },
-            "statistics": {
-                "total": total_bookings,
-                "pending": pending_bookings,
-                "confirmed": confirmed_bookings,
-                "cancelled": cancelled_bookings,
-                "total_revenue": total_revenue
-            }
+            "filters": filters,
+            "statistics": stats
         })
         
     except Exception as e:
         logger.error(f"Error getting bookings for admin: {e}")
         return jsonify({"error": "Failed to fetch bookings"}), 500
 
-# EXISTING PUBLIC API ENDPOINTS (unchanged)
+# PUBLIC API ENDPOINTS
 
 @app.route('/', methods=['GET'])
 def root():
@@ -1473,7 +631,7 @@ def root():
 def get_cars():
     """Get available cars with mandatory date filtering"""
     try:
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
         # Get query parameters - these are now mandatory
@@ -1486,18 +644,12 @@ def get_cars():
             return jsonify({"error": "start_date and end_date are required parameters"}), 400
         
         # Get all active cars
-        query = supabase.table('cars').select('*').eq('is_active', True)
-        
-        if car_class:
-            query = query.eq('class', car_class)
-        
-        response = query.order('brand').execute()
-        all_cars = response.data
+        all_cars = db_service.get_cars(include_inactive=False, car_class=car_class)
         
         # Filter cars by availability for the requested dates
         available_cars = []
         for car in all_cars:
-            is_available, _ = check_car_availability_atomic(car['id'], start_date, end_date)
+            is_available, _ = db_service.check_car_availability(car['id'], start_date, end_date)
             if is_available:
                 available_cars.append(car)
         
@@ -1515,12 +667,11 @@ def get_cars():
 def get_all_cars():
     """Get all cars (active and inactive) without any filtering"""
     try:
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
         # Get all cars without any filtering
-        response = supabase.table('cars').select('*').order('brand').execute()
-        all_cars = response.data
+        all_cars = db_service.get_cars(include_inactive=True)
         
         logger.info(f"Returning all {len(all_cars)} cars (active and inactive)")
         
@@ -1536,20 +687,18 @@ def get_all_cars():
 def get_car(car_id):
     """Get specific car by ID"""
     try:
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
         try:
+            import uuid
             uuid.UUID(car_id)
         except ValueError:
             return jsonify({"error": "Invalid car ID format"}), 400
         
-        response = supabase.table('cars').select('*').eq('id', car_id).eq('is_active', True).execute()
-        
-        if not response.data:
+        car = db_service.get_car_by_id(car_id)
+        if not car:
             return jsonify({"error": "Car not found"}), 404
-        
-        car = response.data[0]
         
         return jsonify(car)
     except Exception as e:
@@ -1560,10 +709,11 @@ def get_car(car_id):
 def get_car_availability(car_id):
     """Get car availability for date range with pricing"""
     try:
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
         try:
+            import uuid
             uuid.UUID(car_id)
         except ValueError:
             return jsonify({"error": "Invalid car ID format"}), 400
@@ -1579,14 +729,12 @@ def get_car_availability(car_id):
             return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
         
         # Get car details
-        car_response = supabase.table('cars').select('*').eq('id', car_id).eq('is_active', True).execute()
-        if not car_response.data:
+        car = db_service.get_car_by_id(car_id)
+        if not car:
             return jsonify({"error": "Car not found"}), 404
         
-        car = car_response.data[0]
-        
         # Check availability
-        is_available, error_msg = check_car_availability_atomic(car_id, start_date, end_date)
+        is_available, error_msg = db_service.check_car_availability(car_id, start_date, end_date)
         
         result = {
             "car": car,
@@ -1622,12 +770,13 @@ def create_booking():
         
         validated_data = validate_booking_data(data)
         
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
         car_id = validated_data['car_id']
         
         # Simple lock mechanism (in production use Redis or database locks)
+        from utils import booking_locks
         if car_id in booking_locks:
             return jsonify({"error": "Car is being booked by another user. Please try again."}), 409
         
@@ -1635,14 +784,12 @@ def create_booking():
         
         try:
             # Get car details
-            car_response = supabase.table('cars').select('*').eq('id', car_id).eq('is_active', True).execute()
-            if not car_response.data:
+            car = db_service.get_car_by_id(car_id)
+            if not car:
                 return jsonify({"error": "Car not found"}), 404
             
-            car = car_response.data[0]
-            
             # Atomic availability check
-            is_available, error_msg = check_car_availability_atomic(
+            is_available, error_msg = db_service.check_car_availability(
                 car_id, validated_data['start_date'], validated_data['end_date']
             )
             if not is_available:
@@ -1673,19 +820,16 @@ def create_booking():
             }
             
             # Insert booking
-            booking_response = supabase.table('bookings').insert(booking_data).execute()
-            if not booking_response.data:
-                return jsonify({"error": "Failed to create booking", "details": str(booking_response.error)}), 500
-            
-            booking = booking_response.data[0]
+            booking = db_service.create_booking(booking_data)
             
             logger.info(f"Booking created: SOF{booking['id'][:8].upper()} for car {car_id} by {booking['client_email']}")
+            
             # Send emails (non-blocking)
             try:
                 # Send booking confirmation to client
-                send_booking_confirmation_email(booking, car)
+                email_service.send_booking_confirmation_email(booking, car)
                 # Send admin notification
-                send_admin_notification_email(booking, car)
+                email_service.send_admin_notification_email(booking, car)
                 logger.info(f"Emails sent for booking SOF{booking['id'][:8].upper()}")
             except Exception as e:
                 logger.error(f"Failed to send emails for booking SOF{booking['id'][:8].upper()}: {e}")
@@ -1718,15 +862,14 @@ def create_booking():
 def get_booking(booking_id):
     """Get booking by ID"""
     try:
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
-        response = supabase.table('bookings').select('*, cars(brand, model, year, class)').eq('id', booking_id).execute()
-        
-        if not response.data:
+        booking = db_service.get_booking_by_id(booking_id)
+        if not booking:
             return jsonify({"error": "Booking not found"}), 404
         
-        return jsonify(response.data[0])
+        return jsonify(booking)
     except Exception as e:
         logger.error(f"Error getting booking {booking_id}: {e}")
         return jsonify({"error": "Failed to fetch booking"}), 500
@@ -1735,15 +878,14 @@ def get_booking(booking_id):
 def get_booking_by_reference(booking_reference):
     """Get booking by reference number"""
     try:
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
-        response = supabase.table('bookings').select('*, cars(brand, model, year, class)').eq('booking_reference', booking_reference).execute()
-        
-        if not response.data:
+        booking = db_service.get_booking_by_reference(booking_reference)
+        if not booking:
             return jsonify({"error": "Booking not found"}), 404
         
-        return jsonify(response.data[0])
+        return jsonify(booking)
     except Exception as e:
         logger.error(f"Error getting booking {booking_reference}: {e}")
         return jsonify({"error": "Failed to fetch booking"}), 500
@@ -1759,40 +901,11 @@ def contact_inquiry():
         if not data:
             return jsonify({"error": "No data provided"}), 400
         
-        # Validate required fields
-        required_fields = ['name', 'email', 'message', 'phone']
-        for field in required_fields:
-            if field not in data or not data[field].strip():
-                return jsonify({"error": f"Missing required field: {field}"}), 400
-        
-        # Honeypot check
-        for honeypot in HONEYPOT_FIELDS:
-            if honeypot in data and data[honeypot]:
-                logger.warning(f"Honeypot field '{honeypot}' was filled from IP: {get_client_ip()}")
-                return jsonify({"error": "Invalid form submission"}), 400
-        
-        # Validate email
-        if not validate_email(data['email'].strip()):
-            return jsonify({"error": "Invalid email format"}), 400
-        
-        # Validate name (minimum 2 characters)
-        if len(data['name'].strip()) < 2:
-            return jsonify({"error": "Name must be at least 2 characters"}), 400
-        
-        # Validate message (minimum 10 characters)
-        if len(data['message'].strip()) < 10:
-            return jsonify({"error": "Message must be at least 10 characters"}), 400
-        
-        # Prepare form data
-        form_data = {
-            'name': data['name'].strip(),
-            'email': data['email'].strip().lower(),
-            'phone': data['phone'].strip(),
-            'message': data['message'].strip()
-        }
+        # Validate and clean form data
+        form_data = validate_contact_form_data(data)
         
         # Send email
-        email_sent = send_contact_form_email(form_data)
+        email_sent = email_service.send_contact_form_email(form_data)
         
         if email_sent:
             logger.info(f"Contact form submitted by {form_data['email']} from IP: {get_client_ip()}")
@@ -1809,6 +922,8 @@ def contact_inquiry():
         
     except TooManyRequests as e:
         return jsonify({"error": str(e)}), 429
+    except BadRequest as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         logger.error(f"Error processing contact form: {e}")
         return jsonify({"error": "Failed to process contact form"}), 500
@@ -1826,9 +941,9 @@ def health_check():
     status_code = 200
     
     # Test database connection
-    if supabase:
+    if db_service:
         try:
-            response = supabase.table('cars').select('id').limit(1).execute()
+            response = db_service.supabase.table('cars').select('id').limit(1).execute()
             health_data['database'] = 'connected'
             health_data['database_response_time'] = 'fast'
         except Exception as e:
@@ -1841,6 +956,7 @@ def health_check():
         status_code = 503
     
     # Test other components
+    from utils import rate_limit_storage, booking_locks
     health_data['rate_limiting'] = 'active' if rate_limit_storage is not None else 'inactive'
     health_data['active_booking_locks'] = len(booking_locks)
     health_data['rate_limit_entries'] = len(rate_limit_storage)
@@ -1848,128 +964,14 @@ def health_check():
     
     return jsonify(health_data), status_code
 
-
 @app.route('/usage-overview', methods=['GET'])
-# @admin_required
 def get_usage_overview():
     """Get complete usage overview - database + storage"""
     try:
-        if not supabase:
+        if not db_service:
             return jsonify({"error": "Database not available"}), 503
         
-        overview = {
-            'database': {},
-            'storage': {},
-            'limits': {
-                'database_mb': 500,  # Free tier
-                'storage_gb': 1      # Free tier
-            }
-        }
-        
-        # Database usage
-        try:
-            # Get database size
-            db_size_query = """
-            SELECT 
-                pg_size_pretty(pg_database_size(current_database())) as size_pretty,
-                pg_database_size(current_database()) as size_bytes
-            """
-            
-            # Note: Supabase може да не поддържа директни SQL заявки чрез API
-            # В този случай ще използваме приблизителна оценка
-            
-            # Count records instead
-            cars_count = supabase.table('cars').select('id', count='exact').execute()
-            bookings_count = supabase.table('bookings').select('id', count='exact').execute()
-            
-            # Estimate size (very rough)
-            estimated_size_mb = (cars_count.count * 0.1) + (bookings_count.count * 0.05)  # KB per record
-            
-            overview['database'] = {
-                'cars_count': cars_count.count,
-                'bookings_count': bookings_count.count,
-                'estimated_size_mb': round(estimated_size_mb, 2),
-                'usage_percent': round((estimated_size_mb / 500) * 100, 1)
-            }
-            
-        except Exception as e:
-            overview['database'] = {'error': str(e)}
-        
-        # Storage usage - try to get bucket info first
-        try:
-            logger.info("Checking storage usage...")
-            total_files = 0
-            total_size_bytes = 0
-            bucket_details = {}
-            
-            # Try to get bucket info first
-            try:
-                logger.info("Attempting to get bucket info...")
-                buckets_info = supabase.storage.list_buckets()
-                logger.info(f"Bucket info response: {buckets_info}")
-                
-                # Check if we can get size info from bucket metadata
-                for bucket_info in buckets_info:
-                    bucket_name = bucket_info.get('name')
-                    if bucket_name:
-                        logger.info(f"Found bucket: {bucket_name}, metadata: {bucket_info}")
-            except Exception as bucket_info_error:
-                logger.warning(f"Could not get bucket info: {bucket_info_error}")
-            
-            # Known buckets to check
-            known_buckets = ['cars']
-            
-            for bucket_name in known_buckets:
-                try:
-                    logger.info(f"Checking bucket: {bucket_name}")
-                    files = supabase.storage.from_(bucket_name).list()
-                    bucket_files = len(files) if files else 0
-                    total_files += bucket_files
-                    
-                    # Calculate total size in bytes
-                    bucket_size_bytes = 0
-                    if files:
-                        for file in files:
-                            file_size = file.get('metadata', {}).get('size', 0)
-                            if isinstance(file_size, (int, float)):
-                                bucket_size_bytes += file_size
-                    
-                    total_size_bytes += bucket_size_bytes
-                    
-                    # Convert to MB
-                    bucket_size_mb = round(bucket_size_bytes / (1024 * 1024), 2)
-                    
-                    logger.info(f"Bucket {bucket_name} has {bucket_files} files, total size: {bucket_size_mb} MB")
-                    
-                    bucket_details[bucket_name] = {
-                        'files_count': bucket_files,
-                        'size_bytes': bucket_size_bytes,
-                        'size_mb': bucket_size_mb,
-                        'sample_files': files[:3] if files else []  # First 3 files as sample
-                    }
-                except Exception as e:
-                    logger.error(f"Error accessing bucket {bucket_name}: {e}")
-                    bucket_details[bucket_name] = {
-                        'files_count': 0,
-                        'error': str(e)
-                    }
-            
-            # Calculate total storage size
-            total_size_mb = round(total_size_bytes / (1024 * 1024), 2)
-            total_size_gb = round(total_size_mb / 1024, 3)
-            
-            overview['storage'] = {
-                'total_files': total_files,
-                'total_size_mb': total_size_mb,
-                'total_size_gb': total_size_gb,
-                'buckets': bucket_details,
-                'estimated_usage_note': 'Check Supabase Dashboard for exact storage usage'
-            }
-            
-        except Exception as e:
-            logger.error(f"Error getting storage info: {e}")
-            overview['storage'] = {'error': str(e)}
-        
+        overview = get_usage_statistics()
         return jsonify(overview)
         
     except Exception as e:
