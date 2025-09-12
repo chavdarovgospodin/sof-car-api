@@ -1,6 +1,6 @@
 # SofCar API
 
-Python Flask REST API backend for SofCar car rental service.
+Modular Python Flask REST API backend for SofCar car rental service.
 
 ## 🚀 Quick Start
 
@@ -30,6 +30,20 @@ Python Flask REST API backend for SofCar car rental service.
    python app.py
    ```
    API available at `http://localhost:5002/api`
+
+## 📁 Modular Structure
+
+```
+/api/
+├── passenger_wsgi.py          # cPanel entry point
+├── app.py                     # Main Flask app (~800 lines)
+├── config.py                  # Centralized configuration
+├── database.py                # Supabase operations
+├── validators.py              # Input validation
+├── email_service.py           # EmailJS integration
+├── auth.py                    # Admin authentication
+└── utils.py                   # Helper functions
+```
 
 ## 📚 API Endpoints
 
@@ -67,6 +81,7 @@ Python Flask REST API backend for SofCar car rental service.
 
 ## 🛠️ Features
 
+- **Modular Architecture:** Clean separation of concerns
 - **Database:** Supabase PostgreSQL with RLS
 - **Validation:** 5-30 day rental period, email/phone validation
 - **Booking Conflicts:** Automatic conflict detection
@@ -98,11 +113,11 @@ Python Flask REST API backend for SofCar car rental service.
 
 **cPanel:**
 
-1. Upload files to cPanel
+1. Upload all files to cPanel
 2. Install Python dependencies
 3. Configure environment variables
-4. Set up `passenger_wsgi.py`
-5. Configure `.htaccess` for URL rewriting
+4. `passenger_wsgi.py` remains the entry point
+5. All modules import automatically
 
 ## 📝 Environment Variables
 
